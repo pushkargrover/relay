@@ -1,0 +1,25 @@
+<svg width="820" height="320" viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', 'SF Mono', Consolas, monospace">
+  <rect x="10" y="10" width="800" height="300" rx="12" fill="#0b0e14" stroke="#222a35" stroke-width="1.5"/>
+  <rect x="10" y="10" width="800" height="40" rx="12" fill="#11151f"/>
+  <rect x="10" y="38" width="800" height="12" fill="#11151f"/>
+  <circle cx="36" cy="30" r="6" fill="#ff5f56"/>
+  <circle cx="58" cy="30" r="6" fill="#ffbd2e"/>
+  <circle cx="80" cy="30" r="6" fill="#27c93f"/>
+  <text x="410" y="34" text-anchor="middle" font-size="13" fill="#8b949e">context-handoff — ~/projects</text>
+
+  <text x="40" y="100" font-size="27" font-weight="700" fill="#3fb950">context-handoff</text>
+  <text x="40" y="130" font-size="15" fill="#6e7681"># save your session before the context window fills</text>
+
+  <text x="40" y="176" font-size="16" fill="#3fb950">$ <tspan fill="#c9d1d9">/plugin install context-handoff@grove-plugins</tspan></text>
+
+  <text x="40" y="222" font-size="15" fill="#8b949e">usage</text>
+  <rect x="110" y="210" width="360" height="16" rx="4" fill="#21262d"/>
+  <rect x="110" y="210" width="324" height="16" rx="4" fill="#d29922"/>
+  <text x="486" y="223" font-size="15" font-weight="700" fill="#d29922">90%</text>
+  <text x="540" y="223" font-size="14" fill="#6e7681">threshold reached</text>
+
+  <text x="40" y="262" font-size="15" fill="#3fb950">&gt;&gt; handoff written -&gt; <tspan fill="#c9d1d9">handoffs/handoff-2026-07-04.md</tspan></text>
+
+  <text x="40" y="298" font-size="16" fill="#3fb950">$ </text>
+  <rect x="62" y="286" width="10" height="16" fill="#c9d1d9"/>
+</svg>
