@@ -1,0 +1,12 @@
+{
+  "name": "grove-plugins",
+  "description": "Plugins by Pushkar Grover. context-handoff: live context monitoring with automatic session handoff documents at 90% usage.",
+  "owner": { "name": "Pushkar Grover" },
+  "plugins": [
+    {
+      "name": "context-handoff",
+      "source": "./",
+      "description": "Monitors context usage every turn and auto-writes a portable handoff document at 90% so progress survives compaction and can resume in any AI agent."
+    }
+  ]
+}

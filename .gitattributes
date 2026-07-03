@@ -1,0 +1,5 @@
+# Unix-executed files must keep LF endings — CRLF breaks sh and python shebangs
+*.sh text eol=lf
+*.py text eol=lf
+# Everything else: normalize to LF in the repo, checkout per-platform default
+* text=auto

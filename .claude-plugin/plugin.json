@@ -1,0 +1,9 @@
+{
+  "name": "context-handoff",
+  "version": "1.0.0",
+  "description": "Auto-generates structured handoff documents before context compaction and via /handoff.",
+  "author": { "name": "Pushkar Grover" },
+  "repository": "https://github.com/pushkargrover/context-handoff",
+  "license": "MIT",
+  "keywords": ["context", "handoff", "session", "compaction", "continuity"]
+}
