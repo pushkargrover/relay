@@ -1,6 +1,22 @@
 {
-  "description": "Relay: per-turn 90% context check (UserPromptSubmit) with a compaction backstop (PreCompact). Both a PowerShell and an sh command are registered per event; the one that does not exist on the current OS fails silently (non-blocking), and trigger.sh additionally no-ops on Windows so the pair never double-fires.",
+  "description": "Relay: per-turn 90% check (UserPromptSubmit), a mid-task emergency check at 95% (PostToolUse), and a compaction backstop (PreCompact). Both a PowerShell and an sh command are registered per event; the one that does not exist on the current OS fails silently (non-blocking), and trigger.sh additionally no-ops on Windows so the pair never double-fires. The once-per-session lock means whichever check trips first is the only one that writes.",
   "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}\\scripts\\trigger.ps1\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/trigger.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [

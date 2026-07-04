@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 # Pin the environment: a leaked threshold override would corrupt every
 # boundary assertion below. Tests own their inputs.
 if (Test-Path env:RELAY_THRESHOLD) { Remove-Item env:RELAY_THRESHOLD }
+if (Test-Path env:RELAY_EMERGENCY_THRESHOLD) { Remove-Item env:RELAY_EMERGENCY_THRESHOLD }
 $trigger  = Join-Path $PSScriptRoot '..\scripts\trigger.ps1'
 $fixtures = Join-Path $PSScriptRoot 'fixtures'
 $lockDir  = Join-Path $env:USERPROFILE '.claude\handoffs\.locks'
@@ -115,6 +116,33 @@ $s = "test-notranscript"; Clear-Lock $s
 $out = Invoke-Trigger (New-HookInput 'C:\does\not\exist.jsonl' $s 'UserPromptSubmit')
 Assert (-not $out) "missing transcript stays silent"
 Assert ($LASTEXITCODE -eq 0) "missing transcript exits 0 (never blocks the user)"
+
+# --- Case 9b: PostToolUse stays silent below the emergency threshold ----------
+# 91% is past the 90% turn-boundary bar but below the 95% mid-task bar, so a
+# mid-task check must NOT interrupt here.
+$s = "test-posttool-quiet"; Clear-Lock $s
+$t = New-Fixture 'usage-ptu-91.jsonl' 3000 176000 3000 'claude-opus-4-8' @()  # 91%
+$out = Invoke-Trigger (New-HookInput $t $s 'PostToolUse')
+Assert (-not $out) "PostToolUse stays silent at 91% (below 95% emergency)"
+Clear-Lock $s
+
+# --- Case 9c: PostToolUse fires at/above the emergency threshold --------------
+$s = "test-posttool-fire"; Clear-Lock $s
+$t = New-Fixture 'usage-ptu-96.jsonl' 3000 189000 3000 'claude-opus-4-8' @()  # 192,000 = 96%
+$out = Invoke-Trigger (New-HookInput $t $s 'PostToolUse')
+$json = $null; try { $json = $out | ConvertFrom-Json } catch {}
+Assert ($null -ne $json) "PostToolUse fires at 96% (mid-task emergency)"
+Assert ($json -and $json.hookSpecificOutput.additionalContext -match 'mid-task') "emergency message is labelled mid-task"
+Clear-Lock $s
+
+# --- Case 9d: RELAY_EMERGENCY_THRESHOLD override --------------------------------
+$s = "test-posttool-env"; Clear-Lock $s
+$t = New-Fixture 'usage-ptu-91b.jsonl' 3000 176000 3000 'claude-opus-4-8' @()  # 91%
+$env:RELAY_EMERGENCY_THRESHOLD = '0.90'
+$out = $(New-HookInput $t $s 'PostToolUse') | powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $trigger
+Remove-Item env:RELAY_EMERGENCY_THRESHOLD
+Assert ([bool]$out) "PostToolUse honors RELAY_EMERGENCY_THRESHOLD override (0.90 fires at 91%)"
+Clear-Lock $s
 
 # --- Case 10: no-project session (cwd = home) -> central .claude\handoffs -------
 $s = "test-homedir"; Clear-Lock $s

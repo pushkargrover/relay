@@ -7,7 +7,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-3fb950?style=flat-square&labelColor=0b0e14)
 ![License](https://img.shields.io/badge/license-MIT-58a6ff?style=flat-square&labelColor=0b0e14)
 ![Dependencies](https://img.shields.io/badge/dependencies-zero-3fb950?style=flat-square&labelColor=0b0e14)
-![Tests](https://img.shields.io/badge/tests-35%20passing-3fb950?style=flat-square&labelColor=0b0e14)
+![Tests](https://img.shields.io/badge/tests-43%20passing-3fb950?style=flat-square&labelColor=0b0e14)
 ![Claude Code](https://img.shields.io/badge/Claude%20Code-plugin-d29922?style=flat-square&labelColor=0b0e14)
 
 **Never lose your session progress again.** Relay monitors your context usage live and automatically writes a structured handoff document at 90%, before compaction erases your work. Resume in any AI agent: Claude, Codex, Gemini, Copilot.
@@ -32,16 +32,20 @@ Then restart Claude Code so hooks load at session start. No npm, no pip, no runt
 ## What it does
 
 ```console
-every turn   ==>  read real token usage from the session transcript
+every turn        ==>  read real token usage from the session transcript
      |
      v
- >= 90% ?    ==>  instruct Claude to write an 8-section handoff (once per session)
+ >= 90% ?         ==>  instruct Claude to write an 8-section handoff (once per session)
      |
      v
- compaction  ==>  PreCompact backstop fires the same handoff, just in case
+ mid-task >= 95%  ==>  emergency check after each tool call, for long single turns
+     |
+     v
+ compaction       ==>  PreCompact backstop fires the same handoff, just in case
 ```
 
 - **Real counts, not estimates.** Relay reads the exact token usage that every assistant message records in the transcript.
+- **Covers long single turns.** The per-turn check runs at turn boundaries; a separate mid-task check (after each tool call, at a higher 95% threshold) catches a long agentic task before it hits the wall.
 - **Zero dependencies.** No daemon, nothing to keep running. The check rides on a hook that already fires each turn.
 - **Never breaks your session.** Every failure path exits silently. A monitor must not harm what it monitors.
 - **Free to run.** The check reads a local file and does arithmetic. No API call, no tokens, no impact on your usage limits.
@@ -79,11 +83,14 @@ Read handoffs/handoff-2026-07-04-143022.md and continue the work described there
 
 ## Configuration
 
-Change the threshold (default `0.90`) via environment variable in `settings.json`:
+Change the thresholds via environment variables in `settings.json`:
 
 ```json
-{ "env": { "RELAY_THRESHOLD": "0.80" } }
+{ "env": { "RELAY_THRESHOLD": "0.80", "RELAY_EMERGENCY_THRESHOLD": "0.97" } }
 ```
+
+- `RELAY_THRESHOLD` (default `0.90`) is the turn-boundary check.
+- `RELAY_EMERGENCY_THRESHOLD` (default `0.95`) is the mid-task check that runs after each tool call. Keep it higher than `RELAY_THRESHOLD` so long tasks are interrupted only when genuinely close to the limit.
 
 Add or adjust model context windows in [`scripts/context-limits.json`](scripts/context-limits.json). The longest model-ID prefix wins, and `_default` covers unknown models conservatively.
 

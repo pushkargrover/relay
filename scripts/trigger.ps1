@@ -25,6 +25,16 @@ if ($env:RELAY_THRESHOLD) {
         $Threshold = $parsed
     }
 }
+# Emergency threshold used ONLY for the mid-task PostToolUse check. It is higher
+# so a long task is interrupted to write a handoff only when truly close to the
+# wall. Override with env var RELAY_EMERGENCY_THRESHOLD (e.g. "0.97").
+$EmergencyThreshold = 0.95
+if ($env:RELAY_EMERGENCY_THRESHOLD) {
+    $parsedE = 0.0
+    if ([double]::TryParse($env:RELAY_EMERGENCY_THRESHOLD, [ref]$parsedE) -and $parsedE -gt 0 -and $parsedE -le 1) {
+        $EmergencyThreshold = $parsedE
+    }
+}
 # How many trailing transcript lines to scan for the newest usage record.
 # Usage appears on every assistant message, so a small tail is always enough.
 $TailLines = 100
@@ -112,7 +122,11 @@ try {
         }
 
         $usagePct = [math]::Round(($contextTokens / $limit) * 100, 1)
-        if (($contextTokens / $limit) -ge $Threshold) { $shouldFire = $true }
+        # PostToolUse is the mid-task check: use the higher emergency threshold so
+        # we interrupt an in-progress task only when close to the wall. Every other
+        # event (UserPromptSubmit) uses the normal turn-boundary threshold.
+        $active = if ($eventName -eq 'PostToolUse') { $EmergencyThreshold } else { $Threshold }
+        if (($contextTokens / $limit) -ge $active) { $shouldFire = $true }
     }
 
     if (-not $shouldFire) { exit 0 }
@@ -133,6 +147,7 @@ try {
     $timestamp   = Get-Date -Format 'yyyy-MM-dd-HHmmss'
     $handoffFile = Join-Path $handoffsDir "handoff-$timestamp.md"
     $reason = if ($eventName -eq 'PreCompact') { 'Context compaction is imminent.' }
+              elseif ($eventName -eq 'PostToolUse') { "Context usage has reached $usagePct% mid-task (emergency threshold)." }
               else { "Context usage has reached $usagePct% of the window." }
 
     $instruction = @"

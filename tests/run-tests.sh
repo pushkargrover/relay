@@ -5,6 +5,7 @@
 
 # Pin the environment: a leaked threshold override corrupts boundary asserts.
 unset RELAY_THRESHOLD
+unset RELAY_EMERGENCY_THRESHOLD
 
 DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 TRIGGER="$DIR/../scripts/trigger.py"
@@ -107,6 +108,26 @@ s=sh-notranscript; clearlock $s
 out=$(invoke "$(hookinput /does/not/exist.jsonl $s UserPromptSubmit)"); rc=$?
 [ -z "$out" ]; assert $? "missing transcript stays silent"
 [ "$rc" = "0" ]; assert $? "missing transcript exits 0 (never blocks the user)"
+
+# 9b: PostToolUse silent below emergency threshold (91% < 95%)
+s=sh-ptu-quiet; clearlock $s
+t=$(fixture usage-ptu-91.jsonl 3000 176000 claude-opus-4-8 3000)
+out=$(invoke "$(hookinput "$t" $s PostToolUse)")
+[ -z "$out" ]; assert $? "PostToolUse stays silent at 91% (below 95% emergency)"; clearlock $s
+
+# 9c: PostToolUse fires at/above emergency threshold (96%)
+s=sh-ptu-fire; clearlock $s
+t=$(fixture usage-ptu-96.jsonl 3000 189000 claude-opus-4-8 3000)
+out=$(invoke "$(hookinput "$t" $s PostToolUse)")
+[ -n "$out" ]; assert $? "PostToolUse fires at 96% (mid-task emergency)"
+echo "$out" | grep -q 'mid-task'; assert $? "emergency message is labelled mid-task"
+clearlock $s
+
+# 9d: RELAY_EMERGENCY_THRESHOLD override
+s=sh-ptu-env; clearlock $s
+t=$(fixture usage-ptu-91b.jsonl 3000 176000 claude-opus-4-8 3000)
+out=$(printf '%s' "$(hookinput "$t" $s PostToolUse)" | RELAY_EMERGENCY_THRESHOLD=0.90 "$PY" "$TRIGGER")
+[ -n "$out" ]; assert $? "PostToolUse honors RELAY_EMERGENCY_THRESHOLD override (0.90 fires at 91%)"; clearlock $s
 
 # 10: home-dir session -> central .claude/handoffs
 s=sh-homedir; clearlock $s

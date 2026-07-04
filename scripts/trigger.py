@@ -18,17 +18,25 @@ from datetime import datetime
 TAIL_LINES = 100
 
 
-def threshold():
-    t = 0.90
-    raw = os.environ.get("RELAY_THRESHOLD")
+def _threshold_env(name, default):
+    raw = os.environ.get(name)
     if raw:
         try:
             v = float(raw)
             if 0 < v <= 1:
-                t = v
+                return v
         except ValueError:
             pass
-    return t
+    return default
+
+
+def threshold():
+    return _threshold_env("RELAY_THRESHOLD", 0.90)
+
+
+def emergency_threshold():
+    # Higher bar used ONLY for the mid-task PostToolUse check.
+    return _threshold_env("RELAY_EMERGENCY_THRESHOLD", 0.95)
 
 
 def read_usage(transcript_path):
@@ -109,7 +117,11 @@ def main():
             return
         limit = context_limit(model)
         usage_pct = round(tokens / limit * 100, 1)
-        if tokens / limit >= threshold():
+        # PostToolUse is the mid-task check: use the higher emergency threshold so
+        # an in-progress task is interrupted only when close to the wall. Every
+        # other event (UserPromptSubmit) uses the normal turn-boundary threshold.
+        active = emergency_threshold() if event_name == "PostToolUse" else threshold()
+        if tokens / limit >= active:
             should_fire = True
 
     if not should_fire:
@@ -129,11 +141,12 @@ def main():
 
     timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
     handoff_file = os.path.join(handoffs_dir, "handoff-" + timestamp + ".md")
-    reason = (
-        "Context compaction is imminent."
-        if event_name == "PreCompact"
-        else "Context usage has reached {}% of the window.".format(usage_pct)
-    )
+    if event_name == "PreCompact":
+        reason = "Context compaction is imminent."
+    elif event_name == "PostToolUse":
+        reason = "Context usage has reached {}% mid-task (emergency threshold).".format(usage_pct)
+    else:
+        reason = "Context usage has reached {}% of the window.".format(usage_pct)
 
     instruction = """[relay] {reason} Before continuing with the user's request, write a session handoff document so progress survives.
 
