@@ -31,6 +31,17 @@ _ANSI = re.compile(r"\x1b\[[0-9;?=]*[A-Za-z]")
 _CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
+def _rec_log(msg):
+    # Log to a file so background/detached auto-recovery runs are diagnosable.
+    try:
+        p = os.path.join(os.path.expanduser("~"), ".claude", "handoffs", ".relay-recover.log")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write("{} {}\n".format(datetime.datetime.now().isoformat(), msg))
+    except OSError:
+        pass
+
+
 def recent_transcripts(count=15):
     items = []
     if not os.path.isdir(PROJECTS_DIR):
@@ -235,12 +246,16 @@ def main(argv=None):
     home = os.path.expanduser("~")
     if args.out:
         handoff_file = args.out
+        od = os.path.dirname(handoff_file)
+        if od:
+            os.makedirs(od, exist_ok=True)
     else:
         is_real_project = os.path.realpath(cwd) != os.path.realpath(home)
         handoffs_dir = os.path.join(cwd, "handoffs") if is_real_project else os.path.join(home, ".claude", "handoffs")
         os.makedirs(handoffs_dir, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
         handoff_file = os.path.join(handoffs_dir, "handoff-{}-local.md".format(ts))
+    _rec_log("start: session={} -> {}".format(meta["session_id"], handoff_file))
 
     model = resolve_model(args.model)
     convo = clean_conversation(target)
@@ -259,8 +274,13 @@ def main(argv=None):
         f.write(header + markdown)
 
     print("\nHandoff saved to: " + handoff_file)
+    _rec_log("ok: " + handoff_file)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as e:  # log failures from detached runs
+        _rec_log("ERROR: {}".format(e))
+        sys.exit(1)

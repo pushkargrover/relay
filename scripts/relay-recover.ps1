@@ -28,6 +28,17 @@ $OllamaUrl   = if ($env:RELAY_OLLAMA_URL) { $env:RELAY_OLLAMA_URL.TrimEnd('/') }
 $ProjectsDir = Join-Path $env:USERPROFILE '.claude\projects'
 $MaxChars    = 12000   # transcript budget fed to the local model (keeps it fast + in-context)
 
+# Log to a file so background/detached runs (auto-recovery) are diagnosable.
+$script:RecLog = Join-Path $env:USERPROFILE '.claude\handoffs\.relay-recover.log'
+function Write-RecLog($m) {
+    try {
+        $d = Split-Path $script:RecLog -Parent
+        if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+        Add-Content -Path $script:RecLog -Value "$(Get-Date -Format o) $m"
+    } catch {}
+}
+trap { Write-RecLog "ERROR: $($_.Exception.Message)"; break }
+
 function Show-Usage {
     Get-Content $PSCommandPath | Select-Object -First 18 | ForEach-Object { $_ -replace '^# ?', '' }
 }
@@ -208,6 +219,8 @@ if ($meta.Snippet) { Write-Host "  `"$($meta.Snippet)`"" -ForegroundColor DarkGr
 $cwd = (Get-Location).Path
 if ($Out) {
     $handoffFile = $Out
+    $od = Split-Path $handoffFile -Parent
+    if ($od -and -not (Test-Path $od)) { New-Item -ItemType Directory -Force -Path $od | Out-Null }
 } else {
     $isRealProject = ($cwd.TrimEnd('\') -ne $env:USERPROFILE.TrimEnd('\'))
     $handoffsDir = if ($isRealProject) { Join-Path $cwd 'handoffs' } else { Join-Path $env:USERPROFILE '.claude\handoffs' }
@@ -215,6 +228,7 @@ if ($Out) {
     $ts = Get-Date -Format 'yyyy-MM-dd-HHmmss'
     $handoffFile = Join-Path $handoffsDir "handoff-$ts-local.md"
 }
+Write-RecLog "start: session=$($meta.SessionId) -> $handoffFile"
 
 $model = Resolve-Model
 $convo = Get-CleanConversation $target
@@ -229,3 +243,4 @@ $header = "<!-- Generated locally by Relay via Ollama ($model). Source session: 
 Set-Content -Path $handoffFile -Value ($header + $markdown) -Encoding utf8
 
 Write-Host "`nHandoff saved to: $handoffFile" -ForegroundColor Green
+Write-RecLog "ok: $handoffFile"

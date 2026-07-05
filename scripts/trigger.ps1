@@ -107,9 +107,19 @@ try {
                 Set-Content -Path $recLock -Value $recFile -Encoding ascii
                 if ($env:RELAY_NO_SPAWN -ne '1') {
                     $recoverScript = Join-Path $PSScriptRoot 'relay-recover.ps1'
-                    Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ErrorAction SilentlyContinue -ArgumentList @(
-                        '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$recoverScript,
-                        '-Session',$sessionId,'-Out',$recFile)
+                    $recLog = Join-Path $env:USERPROFILE '.claude\handoffs\.relay-recover.log'
+                    try { Add-Content -Path $recLog -Value "$(Get-Date -Format o) trigger: 429 detected, launching recovery for $sessionId -> $recFile" } catch {}
+                    # Launch via WMI so the process is owned by the WMI service and
+                    # SURVIVES Claude Code killing the hook's process tree on return.
+                    # Start-Process children stay in the hook's job and get killed.
+                    $cmdLine = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$recoverScript`" -Session $sessionId -Out `"$recFile`""
+                    try {
+                        ([wmiclass]'Win32_Process').Create($cmdLine) | Out-Null
+                    } catch {
+                        Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ErrorAction SilentlyContinue -ArgumentList @(
+                            '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$recoverScript,
+                            '-Session',$sessionId,'-Out',$recFile)
+                    }
                 }
                 exit 0   # Claude is locked out; nothing to inject.
             }

@@ -136,8 +136,15 @@ def main():
                 with open(rec_lock, "w", encoding="ascii") as f:
                     f.write(rec_file)
                 if os.environ.get("RELAY_NO_SPAWN") != "1":
+                    try:
+                        with open(os.path.join(home, ".claude", "handoffs", ".relay-recover.log"), "a", encoding="utf-8") as lf:
+                            lf.write("{} trigger: 429 detected, launching recovery for {} -> {}\n".format(
+                                datetime.now().isoformat(), session_id, rec_file))
+                    except OSError:
+                        pass
                     recover_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay-recover.py")
                     try:
+                        # start_new_session detaches the child so it survives the hook returning.
                         subprocess.Popen([sys.executable, recover_py, "--session", session_id, "--out", rec_file],
                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
                     except Exception:
