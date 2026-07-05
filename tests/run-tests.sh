@@ -1,159 +1,113 @@
 #!/bin/sh
-# run-tests.sh - unit tests for scripts/trigger.py (the mac/Linux implementation).
-# Mirrors tests/run-tests.ps1 case-for-case so both platforms honor one contract.
-# Usage: sh tests/run-tests.sh          Exit 0 = all pass, 1 = failures.
+# run-tests.sh - unit tests for scripts/trigger.py (token-budget triggering).
+# Mirrors tests/run-tests.ps1 case-for-case. Usage: sh tests/run-tests.sh
 
-# Pin the environment: a leaked threshold override corrupts boundary asserts.
-unset RELAY_THRESHOLD
-unset RELAY_EMERGENCY_THRESHOLD
+# Pin the environment: a leaked budget override corrupts boundary asserts.
+unset RELAY_TOKEN_THRESHOLD
+unset RELAY_EMERGENCY_TOKEN_THRESHOLD
 
 DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 TRIGGER="$DIR/../scripts/trigger.py"
 FIXTURES="$DIR/fixtures"
 mkdir -p "$FIXTURES"
 
-# Find Python 3 the same way trigger.sh does (python3 may be a broken stub on
-# Windows Git Bash, so verify it actually runs).
 PY=""
-if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' >/dev/null 2>&1; then
-    PY=python3
-elif command -v python >/dev/null 2>&1 && python -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
-    PY=python
-else
-    echo "SKIP: no Python 3 available"; exit 0
-fi
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' >/dev/null 2>&1; then PY=python3
+elif command -v python >/dev/null 2>&1 && python -c 'import sys; sys.exit(0 if sys.version_info[0]==3 else 1)' >/dev/null 2>&1; then PY=python
+else echo "SKIP: no Python 3 available"; exit 0; fi
 
-HOMEDIR=$("$PY" -c "import os; print(os.path.expanduser('~'))")
+HOMEDIR=$("$PY" -c "import os;print(os.path.expanduser('~'))")
 LOCKDIR="$HOMEDIR/.claude/handoffs/.locks"
 PASS=0; FAIL=0
 
 invoke() { printf '%s' "$1" | "$PY" "$TRIGGER"; }
+assert() { if [ "$1" = "0" ]; then PASS=$((PASS+1)); echo "  PASS  $2"; else FAIL=$((FAIL+1)); echo "  FAIL  $2"; fi; }
 
-assert() { # $1 = condition result (0/1 as exit code semantics via test), $2 = name
-    if [ "$1" = "0" ]; then PASS=$((PASS+1)); echo "  PASS  $2"
-    else FAIL=$((FAIL+1)); echo "  FAIL  $2"; fi
-}
-
-fixture() { # name input_tok cache_read cache_new model [extra_line]
-    f="$FIXTURES/$1"
+fixture() { # name total_tokens [extra_line]
+    f="$FIXTURES/$1"; inp=$(( $2 - 2000 ))
     {
         echo '{"type":"user","message":{"role":"user","content":"hello"}}'
-        echo '{"type":"assistant","message":{"model":"'"$4"'","usage":{"input_tokens":'"$2"',"cache_read_input_tokens":'"$3"',"cache_creation_input_tokens":'"$5"',"output_tokens":500}}}'
-        [ -n "$6" ] && echo "$6"
+        echo '{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":'"$inp"',"cache_read_input_tokens":1000,"cache_creation_input_tokens":1000,"output_tokens":500}}}'
+        [ -n "$3" ] && echo "$3"
     } > "$f"
     echo "$f"
 }
+hookinput() { cwd="${4:-$FIXTURES}"; "$PY" -c "import json,sys;print(json.dumps({'session_id':sys.argv[2],'transcript_path':sys.argv[1],'cwd':sys.argv[4],'hook_event_name':sys.argv[3]}))" "$1" "$2" "$3" "$cwd"; }
+clearlock() { rm -f "$LOCKDIR/$1.lock" "$LOCKDIR/$1.last"; }
 
-hookinput() { # transcript session event [cwd]
-    cwd="${4:-$FIXTURES}"
-    "$PY" -c "import json,sys; print(json.dumps({'session_id':sys.argv[2],'transcript_path':sys.argv[1],'cwd':sys.argv[4],'hook_event_name':sys.argv[3]}))" "$1" "$2" "$3" "$cwd"
-}
-
-clearlock() { rm -f "$LOCKDIR/$1.lock"; }
-
-echo "relay trigger.py tests"
+echo "relay trigger.py tests (token budgets: normal=150000 emergency=190000)"
 echo "--------------------------------"
 
-# 1: 50% silent
-s=sh-50pct; clearlock $s
-t=$(fixture usage-50.jsonl 3000 94000 claude-opus-4-8 3000)
+s=s-below; clearlock $s
+t=$(fixture tok-100k.jsonl 100000)
+out=$(invoke "$(hookinput "$t" $s UserPromptSubmit)"); [ -z "$out" ]; assert $? "100k tokens stays silent"; clearlock $s
+
+s=s-149; clearlock $s
+t=$(fixture tok-149k.jsonl 149000)
+out=$(invoke "$(hookinput "$t" $s UserPromptSubmit)"); [ -z "$out" ]; assert $? "149k stays silent (just below budget)"; clearlock $s
+
+s=s-150; clearlock $s
+t=$(fixture tok-150k.jsonl 150000)
+out=$(invoke "$(hookinput "$t" $s UserPromptSubmit)"); [ -n "$out" ]; assert $? "exactly 150k fires (inclusive)"; clearlock $s
+
+s=s-151; clearlock $s
+t=$(fixture tok-151k.jsonl 151000)
 out=$(invoke "$(hookinput "$t" $s UserPromptSubmit)")
-[ -z "$out" ]; assert $? "50% usage stays silent"; clearlock $s
+[ -n "$out" ]; assert $? "151k fires"
+echo "$out" | grep -q '151,000 tokens'; assert $? "message reports token count (not a percentage)"
+echo "$out" | grep -q 'handoff-20'; assert $? "message contains a timestamped handoff path"
+echo "$out" | grep -q '%'; [ $? -ne 0 ]; assert $? "message contains no bogus percentage"
 
-# 2: 89% silent
-s=sh-89pct; clearlock $s
-t=$(fixture usage-89.jsonl 3000 172000 claude-opus-4-8 3000)
-out=$(invoke "$(hookinput "$t" $s UserPromptSubmit)")
-[ -z "$out" ]; assert $? "89% usage stays silent"; clearlock $s
+t=$(fixture tok-200k.jsonl 200000)
+out=$(invoke "$(hookinput "$t" s-151 UserPromptSubmit)"); [ -z "$out" ]; assert $? "second crossing stays silent (lock)"; clearlock s-151
 
-# 3: 91% fires + content checks
-s=sh-91pct; clearlock $s
-t=$(fixture usage-91.jsonl 3000 176000 claude-opus-4-8 3000)
-out=$(invoke "$(hookinput "$t" $s UserPromptSubmit)")
-[ -n "$out" ]; assert $? "91% usage fires"
-echo "$out" | grep -q '91'; assert $? "fire message reports the percentage"
-echo "$out" | grep -q 'handoff-20'; assert $? "fire message contains a timestamped handoff path"
+s=s-precompact; clearlock $s
+t=$(fixture tok-low.jsonl 20000)
+out=$(invoke "$(hookinput "$t" $s PreCompact)"); [ -n "$out" ]; assert $? "PreCompact fires even at low tokens"; clearlock $s
 
-# 4: exactly 90% fires
-s=sh-90pct; clearlock $s
-t=$(fixture usage-90.jsonl 3000 174000 claude-opus-4-8 3000)
-out=$(invoke "$(hookinput "$t" $s UserPromptSubmit)")
-[ -n "$out" ]; assert $? "exactly 90% fires (inclusive threshold)"; clearlock $s
+s=s-midwrite; clearlock $s
+t=$(fixture tok-midwrite.jsonl 151000 '{"type":"assistant","message":{"usage":{"input_tokens":')
+out=$(invoke "$(hookinput "$t" $s UserPromptSubmit)"); [ -n "$out" ]; assert $? "truncated last line skipped, prior record used"; clearlock $s
 
-# 5: lock prevents second fire (sh-91pct lock written by case 3)
-t=$(fixture usage-91b.jsonl 3000 180000 claude-opus-4-8 3000)
-out=$(invoke "$(hookinput "$t" sh-91pct UserPromptSubmit)")
-[ -z "$out" ]; assert $? "second crossing in same session stays silent (lock)"; clearlock sh-91pct
+s=s-ptu-quiet; clearlock $s
+t=$(fixture tok-160k.jsonl 160000)
+out=$(invoke "$(hookinput "$t" $s PostToolUse)"); [ -z "$out" ]; assert $? "PostToolUse silent at 160k (below 190k emergency)"; clearlock $s
 
-# 6: PreCompact backstop
-s=sh-precompact; clearlock $s
-t=$(fixture usage-low.jsonl 3000 40000 claude-opus-4-8 3000)
-out=$(invoke "$(hookinput "$t" $s PreCompact)")
-[ -n "$out" ]; assert $? "PreCompact fires even at low usage"; clearlock $s
+s=s-ptu-fire; clearlock $s
+t=$(fixture tok-195k.jsonl 195000)
+out=$(invoke "$(hookinput "$t" $s PostToolUse)")
+[ -n "$out" ]; assert $? "PostToolUse fires at 195k"
+echo "$out" | grep -q 'mid-task'; assert $? "emergency message labelled mid-task"; clearlock $s
 
-# 7: truncated last line tolerated
-s=sh-midwrite; clearlock $s
-t=$(fixture usage-midwrite.jsonl 3000 176000 claude-opus-4-8 3000 '{"type":"assistant","message":{"usage":{"input_tokens":')
-out=$(invoke "$(hookinput "$t" $s UserPromptSubmit)")
-[ -n "$out" ]; assert $? "truncated last line skipped, prior record used"; clearlock $s
+s=s-throttle; clearlock $s
+mkdir -p "$LOCKDIR"; date +%s > "$LOCKDIR/$s.last"
+t=$(fixture tok-throttle.jsonl 200000)
+out=$(invoke "$(hookinput "$t" $s PostToolUse)"); [ -z "$out" ]; assert $? "PostToolUse throttled when checked recently"
+rm -f "$LOCKDIR/$s.last"
+out=$(invoke "$(hookinput "$t" $s PostToolUse)"); [ -n "$out" ]; assert $? "PostToolUse fires once throttle window passes"; clearlock $s
 
-# 8: unknown model -> default limit
-s=sh-unknown; clearlock $s
-t=$(fixture usage-unknown.jsonl 3000 176000 totally-new-model-9000 3000)
-out=$(invoke "$(hookinput "$t" $s UserPromptSubmit)")
-[ -n "$out" ]; assert $? "unknown model uses _default limit and still fires"; clearlock $s
+s=s-env; clearlock $s
+t=$(fixture tok-60k.jsonl 60000)
+out=$(printf '%s' "$(hookinput "$t" $s UserPromptSubmit)" | RELAY_TOKEN_THRESHOLD=50000 "$PY" "$TRIGGER")
+[ -n "$out" ]; assert $? "RELAY_TOKEN_THRESHOLD override fires at 60k when budget lowered to 50k"; clearlock $s
 
-# 9: missing transcript -> silent, exit 0
-s=sh-notranscript; clearlock $s
+s=s-home; clearlock $s
+t=$(fixture tok-home.jsonl 151000)
+out=$(invoke "$(hookinput "$t" $s UserPromptSubmit "$HOMEDIR")")
+echo "$out" | grep -qF '.claude'; assert $? "home-dir session saves to central .claude/handoffs"; clearlock $s
+
+s=s-proj; clearlock $s
+t=$(fixture tok-proj.jsonl 151000)
+out=$(invoke "$(hookinput "$t" $s UserPromptSubmit "$FIXTURES")")
+echo "$out" | grep -qF 'handoffs'; assert $? "project session saves to project-local handoffs"; clearlock $s
+
+s=s-notx; clearlock $s
 out=$(invoke "$(hookinput /does/not/exist.jsonl $s UserPromptSubmit)"); rc=$?
 [ -z "$out" ]; assert $? "missing transcript stays silent"
-[ "$rc" = "0" ]; assert $? "missing transcript exits 0 (never blocks the user)"
-
-# 9b: PostToolUse silent below emergency threshold (91% < 95%)
-s=sh-ptu-quiet; clearlock $s
-t=$(fixture usage-ptu-91.jsonl 3000 176000 claude-opus-4-8 3000)
-out=$(invoke "$(hookinput "$t" $s PostToolUse)")
-[ -z "$out" ]; assert $? "PostToolUse stays silent at 91% (below 95% emergency)"; clearlock $s
-
-# 9c: PostToolUse fires at/above emergency threshold (96%)
-s=sh-ptu-fire; clearlock $s
-t=$(fixture usage-ptu-96.jsonl 3000 189000 claude-opus-4-8 3000)
-out=$(invoke "$(hookinput "$t" $s PostToolUse)")
-[ -n "$out" ]; assert $? "PostToolUse fires at 96% (mid-task emergency)"
-echo "$out" | grep -q 'mid-task'; assert $? "emergency message is labelled mid-task"
-clearlock $s
-
-# 9d: RELAY_EMERGENCY_THRESHOLD override
-s=sh-ptu-env; clearlock $s
-t=$(fixture usage-ptu-91b.jsonl 3000 176000 claude-opus-4-8 3000)
-out=$(printf '%s' "$(hookinput "$t" $s PostToolUse)" | RELAY_EMERGENCY_THRESHOLD=0.90 "$PY" "$TRIGGER")
-[ -n "$out" ]; assert $? "PostToolUse honors RELAY_EMERGENCY_THRESHOLD override (0.90 fires at 91%)"; clearlock $s
-
-# 10: home-dir session -> central .claude/handoffs
-s=sh-homedir; clearlock $s
-t=$(fixture usage-home.jsonl 3000 176000 claude-opus-4-8 3000)
-out=$(invoke "$(hookinput "$t" $s UserPromptSubmit "$HOMEDIR")")
-echo "$out" | grep -qF '.claude'; assert $? "home-dir session saves to central .claude/handoffs"
-clearlock $s
-
-# 11: project session -> project-local handoffs
-s=sh-projdir; clearlock $s
-t=$(fixture usage-proj.jsonl 3000 176000 claude-opus-4-8 3000)
-out=$(invoke "$(hookinput "$t" $s UserPromptSubmit "$FIXTURES")")
-echo "$out" | grep -qF 'handoffs'; assert $? "project session saves to project-local handoffs"
-echo "$out" | grep -qF "$HOMEDIR/.claude/handoffs/handoff" ; [ $? -ne 0 ]; assert $? "project session does not use the central dir"
-clearlock $s
-
-# 12: garbage stdin -> silent, exit 0
-out=$(printf 'not-json-at-all' | "$PY" "$TRIGGER"); rc=$?
+[ "$rc" = "0" ]; assert $? "missing transcript exits 0"
+out=$(printf 'not-json' | "$PY" "$TRIGGER"); rc=$?
 [ -z "$out" ]; assert $? "garbage stdin stays silent"
 [ "$rc" = "0" ]; assert $? "garbage stdin exits 0"
-
-# 13: threshold env override honored
-s=sh-envthresh; clearlock $s
-t=$(fixture usage-env.jsonl 3000 94000 claude-opus-4-8 3000)   # 50%
-out=$(printf '%s' "$(hookinput "$t" $s UserPromptSubmit)" | RELAY_THRESHOLD=0.40 "$PY" "$TRIGGER")
-[ -n "$out" ]; assert $? "env threshold override (0.40) fires at 50%"; clearlock $s
 
 echo "--------------------------------"
 echo "$PASS passed, $FAIL failed"

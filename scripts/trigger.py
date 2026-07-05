@@ -2,44 +2,49 @@
 """trigger.py - Relay plugin (mac/Linux; invoked via trigger.sh).
 
 Mirrors scripts/trigger.ps1 exactly:
-  UserPromptSubmit - read real token usage from the session transcript (JSONL)
-                     and fire a handoff instruction at >= the threshold (default 90%).
-  PreCompact       - backstop: fire unconditionally if no handoff was written yet.
+  UserPromptSubmit - fire a handoff once context reaches the token budget.
+  PostToolUse      - mid-task safety at a higher emergency budget; throttled so it
+                     does not run the full check after every single tool call.
+  PreCompact       - reliable near-full backstop (Claude Code knows the true window).
+
+Absolute token budgets, not "% of window": the real context window is not exposed
+to hooks and varies by model, so dividing by a hardcoded limit gave wrong
+percentages and mis-timed firing. PreCompact covers the true limit per model.
 
 Contract: hook input JSON on stdin; JSON with hookSpecificOutput.additionalContext
-on stdout when firing, nothing otherwise. Always exit 0 - a monitoring hook must
-never block the user's prompt.
+on stdout when firing, nothing otherwise. Always exit 0.
 """
 import json
 import os
 import sys
+import time
 from datetime import datetime
 
-TAIL_LINES = 100
+TAIL_LINES = 40
+THROTTLE_SECONDS = 15
 
 
-def _threshold_env(name, default):
+def budget_env(name, default):
     raw = os.environ.get(name)
     if raw:
         try:
-            v = float(raw)
-            if 0 < v <= 1:
+            v = int(raw)
+            if v > 0:
                 return v
         except ValueError:
             pass
     return default
 
 
-def threshold():
-    return _threshold_env("RELAY_THRESHOLD", 0.90)
+def token_threshold():
+    return budget_env("RELAY_TOKEN_THRESHOLD", 150000)
 
 
-def emergency_threshold():
-    # Higher bar used ONLY for the mid-task PostToolUse check.
-    return _threshold_env("RELAY_EMERGENCY_THRESHOLD", 0.95)
+def emergency_token_threshold():
+    return budget_env("RELAY_EMERGENCY_TOKEN_THRESHOLD", 190000)
 
 
-def read_usage(transcript_path):
+def read_context_tokens(transcript_path):
     """Newest assistant usage record ~= full current context size."""
     with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
         lines = f.readlines()[-TAIL_LINES:]
@@ -50,35 +55,14 @@ def read_usage(transcript_path):
         try:
             rec = json.loads(line)
         except json.JSONDecodeError:
-            continue  # tolerate a mid-write partial line
-        msg = rec.get("message") or {}
-        usage = msg.get("usage")
+            continue
+        usage = (rec.get("message") or {}).get("usage")
         if not usage:
             continue
-        tokens = (
-            int(usage.get("input_tokens") or 0)
-            + int(usage.get("cache_read_input_tokens") or 0)
-            + int(usage.get("cache_creation_input_tokens") or 0)
-        )
-        return tokens, msg.get("model") or ""
-    return None, None
-
-
-def context_limit(model):
-    """Longest matching model prefix wins; '_default' is the fallback."""
-    limits_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "context-limits.json")
-    limit = 200000
-    try:
-        with open(limits_path, "r", encoding="utf-8") as f:
-            limits = json.load(f).get("limits", {})
-        best = ""
-        for prefix in limits:
-            if prefix != "_default" and model.startswith(prefix) and len(prefix) > len(best):
-                best = prefix
-        limit = int(limits[best]) if best else int(limits.get("_default", limit))
-    except Exception:
-        pass
-    return limit
+        return (int(usage.get("input_tokens") or 0)
+                + int(usage.get("cache_read_input_tokens") or 0)
+                + int(usage.get("cache_creation_input_tokens") or 0))
+    return None
 
 
 def main():
@@ -98,30 +82,42 @@ def main():
     if not project_dir or not os.path.isdir(project_dir):
         project_dir = os.getcwd()
 
-    # Once-per-session lock: a session hovering at the threshold fires once.
     lock_dir = os.path.join(home, ".claude", "handoffs", ".locks")
     lock_file = os.path.join(lock_dir, session_id + ".lock")
+
+    # Once-per-session lock (cheap, before any file read).
     if os.path.exists(lock_file):
         return
 
+    # Throttle the frequent PostToolUse check.
+    if event_name == "PostToolUse":
+        stamp_file = os.path.join(lock_dir, session_id + ".last")
+        now = int(time.time())
+        if os.path.exists(stamp_file):
+            try:
+                with open(stamp_file) as f:
+                    last = int((f.read() or "0").strip() or "0")
+                if now - last < THROTTLE_SECONDS:
+                    return
+            except (ValueError, OSError):
+                pass
+        os.makedirs(lock_dir, exist_ok=True)
+        with open(stamp_file, "w", encoding="ascii") as f:
+            f.write(str(now))
+
     should_fire = False
-    usage_pct = None
+    context_tokens = None
 
     if event_name == "PreCompact":
-        should_fire = True  # compaction is about to erase context
+        should_fire = True
     else:
         if not transcript_path or not os.path.isfile(transcript_path):
             return
-        tokens, model = read_usage(transcript_path)
-        if not tokens or tokens <= 0:
+        context_tokens = read_context_tokens(transcript_path)
+        if not context_tokens or context_tokens <= 0:
             return
-        limit = context_limit(model)
-        usage_pct = round(tokens / limit * 100, 1)
-        # PostToolUse is the mid-task check: use the higher emergency threshold so
-        # an in-progress task is interrupted only when close to the wall. Every
-        # other event (UserPromptSubmit) uses the normal turn-boundary threshold.
-        active = emergency_threshold() if event_name == "PostToolUse" else threshold()
-        if tokens / limit >= active:
+        budget = emergency_token_threshold() if event_name == "PostToolUse" else token_threshold()
+        if context_tokens >= budget:
             should_fire = True
 
     if not should_fire:
@@ -131,22 +127,19 @@ def main():
     with open(lock_file, "w", encoding="ascii") as f:
         f.write(datetime.now().isoformat())
 
-    # Save inside the project when there is one; otherwise the central
-    # ~/.claude/handoffs so we never litter the user's home directory.
     is_real_project = os.path.isdir(project_dir) and os.path.realpath(project_dir) != os.path.realpath(home)
-    handoffs_dir = (
-        os.path.join(project_dir, "handoffs") if is_real_project
-        else os.path.join(home, ".claude", "handoffs")
-    )
+    handoffs_dir = (os.path.join(project_dir, "handoffs") if is_real_project
+                    else os.path.join(home, ".claude", "handoffs"))
 
     timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
     handoff_file = os.path.join(handoffs_dir, "handoff-" + timestamp + ".md")
+    token_str = "{:,}".format(context_tokens) if context_tokens else "many"
     if event_name == "PreCompact":
         reason = "Context compaction is imminent."
     elif event_name == "PostToolUse":
-        reason = "Context usage has reached {}% mid-task (emergency threshold).".format(usage_pct)
+        reason = "Context has reached {} tokens mid-task.".format(token_str)
     else:
-        reason = "Context usage has reached {}% of the window.".format(usage_pct)
+        reason = "Context has reached {} tokens.".format(token_str)
 
     instruction = """[relay] {reason} Before continuing with the user's request, write a session handoff document so progress survives.
 
@@ -174,13 +167,8 @@ Required structure (fill every section from this conversation):
 (conventions, warnings, non-obvious context)
 
 After writing it, tell the user: "Handoff saved to: {handoff_file}" and then continue with their request.
-""".format(
-        reason=reason,
-        handoffs_dir=handoffs_dir,
-        handoff_file=handoff_file,
-        generated=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        project_dir=project_dir,
-    )
+""".format(reason=reason, handoffs_dir=handoffs_dir, handoff_file=handoff_file,
+           generated=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), project_dir=project_dir)
 
     print(json.dumps({
         "hookSpecificOutput": {
@@ -194,5 +182,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        pass  # a monitor must never break the session it monitors
+        pass
     sys.exit(0)

@@ -1,46 +1,49 @@
 # trigger.ps1 - Relay plugin
 #
-# Runs on two hook events (routed via hooks.json):
-#   UserPromptSubmit - every user turn: read real token usage from the session
-#                      transcript (JSONL) and fire a handoff instruction at >=90%.
-#   PreCompact       - backstop: if compaction is imminent and no handoff was
-#                      written this session, fire unconditionally.
+# Runs on three hook events (routed via hooks.json):
+#   UserPromptSubmit - every user turn: fire a handoff once the session's context
+#                      reaches the token budget.
+#   PostToolUse      - mid-task safety: fire at a higher emergency budget. Throttled
+#                      so it does not run the full check after every single tool call.
+#   PreCompact       - backstop: fire unconditionally right before compaction. This
+#                      is the RELIABLE near-full signal, since Claude Code knows the
+#                      true (model-specific) window and we do not.
+#
+# Why absolute token budgets, not "% of window": the real context window is not
+# exposed to hooks (not in the transcript, hook input, CLI, or API), and it varies
+# by model (opus-4-8 alone is >400K). Dividing by a hardcoded limit produced wrong
+# percentages (e.g. 214%) and mis-timed firing. A token budget is model-agnostic
+# and honest; PreCompact covers the true limit for every model.
 #
 # Contract with Claude Code:
 #   stdin  : JSON  { session_id, transcript_path, cwd, hook_event_name, ... }
 #   stdout : JSON  { hookSpecificOutput.additionalContext } to inject context,
 #            or nothing when there is nothing to do.
-#   Exit 0 always — a monitoring hook must never block the user's prompt.
+#   Exit 0 always - a monitoring hook must never block the user's prompt.
 
 param()
 $ErrorActionPreference = 'Stop'
 
-# The threshold as a fraction of the model's context window.
-# Override with env var RELAY_THRESHOLD (e.g. "0.80"), useful for
-# users who want earlier handoffs and for end-to-end testing.
-$Threshold = 0.90
-if ($env:RELAY_THRESHOLD) {
-    $parsed = 0.0
-    if ([double]::TryParse($env:RELAY_THRESHOLD, [ref]$parsed) -and $parsed -gt 0 -and $parsed -le 1) {
-        $Threshold = $parsed
+function Get-BudgetEnv([string]$name, [long]$default) {
+    $val = [Environment]::GetEnvironmentVariable($name)
+    if ($val) {
+        $n = 0L
+        if ([long]::TryParse($val, [ref]$n) -and $n -gt 0) { return $n }
     }
+    return $default
 }
-# Emergency threshold used ONLY for the mid-task PostToolUse check. It is higher
-# so a long task is interrupted to write a handoff only when truly close to the
-# wall. Override with env var RELAY_EMERGENCY_THRESHOLD (e.g. "0.97").
-$EmergencyThreshold = 0.95
-if ($env:RELAY_EMERGENCY_THRESHOLD) {
-    $parsedE = 0.0
-    if ([double]::TryParse($env:RELAY_EMERGENCY_THRESHOLD, [ref]$parsedE) -and $parsedE -gt 0 -and $parsedE -le 1) {
-        $EmergencyThreshold = $parsedE
-    }
-}
-# How many trailing transcript lines to scan for the newest usage record.
-# Usage appears on every assistant message, so a small tail is always enough.
-$TailLines = 100
+
+# Fire the turn-boundary handoff once context reaches this many tokens.
+$TokenThreshold = Get-BudgetEnv 'RELAY_TOKEN_THRESHOLD' 150000
+# Higher budget for the mid-task PostToolUse check (interrupt only when close).
+$EmergencyTokenThreshold = Get-BudgetEnv 'RELAY_EMERGENCY_TOKEN_THRESHOLD' 190000
+# Only scan the tail of the transcript; the newest usage record is near the end.
+$TailLines = 40
+# Do not run the expensive transcript read more than once per this many seconds
+# on PostToolUse (which fires after every tool call).
+$ThrottleSeconds = 15
 
 function Get-Prop($obj, $name) {
-    # Safe property access on PSCustomObject (works under any StrictMode).
     if ($null -eq $obj) { return $null }
     $p = $obj.PSObject.Properties[$name]
     if ($p) { return $p.Value } else { return $null }
@@ -59,96 +62,69 @@ try {
     if (-not $sessionId) { $sessionId = 'unknown' }
     if (-not $projectDir -or -not (Test-Path $projectDir)) { $projectDir = (Get-Location).Path }
 
-    # ---- 2. Once-per-session lock -------------------------------------------
-    # A session hovering around the threshold must not spam handoff files.
     $lockDir  = Join-Path $env:USERPROFILE '.claude\handoffs\.locks'
     $lockFile = Join-Path $lockDir "$sessionId.lock"
+
+    # ---- 2. Once-per-session lock (cheap, before any file read) -------------
     if (Test-Path $lockFile) { exit 0 }
 
-    # ---- 3. Decide whether to fire -------------------------------------------
+    # ---- 3. Throttle the frequent PostToolUse check -------------------------
+    if ($eventName -eq 'PostToolUse') {
+        $stampFile = Join-Path $lockDir "$sessionId.last"
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        if (Test-Path $stampFile) {
+            $last = 0L
+            [long]::TryParse((Get-Content $stampFile -Raw -ErrorAction SilentlyContinue).Trim(), [ref]$last) | Out-Null
+            if (($now - $last) -lt $ThrottleSeconds) { exit 0 }
+        }
+        if (-not (Test-Path $lockDir)) { New-Item -ItemType Directory -Force -Path $lockDir | Out-Null }
+        Set-Content -Path $stampFile -Value $now -Encoding ascii
+    }
+
+    # ---- 4. Decide whether to fire ------------------------------------------
     $shouldFire = $false
-    $usagePct   = $null
+    $contextTokens = $null
 
     if ($eventName -eq 'PreCompact') {
-        # Backstop: compaction is about to erase context. Always fire.
-        $shouldFire = $true
+        $shouldFire = $true   # reliable near-full backstop
     }
     else {
-        # Per-turn check: read the newest assistant usage record.
         if (-not $transcriptPath -or -not (Test-Path $transcriptPath)) { exit 0 }
-
         $lines = Get-Content -Path $transcriptPath -Tail $TailLines -ErrorAction Stop
-        $model = $null
-        $contextTokens = $null
-
-        # Scan newest-first; the latest assistant message's usage reflects the
-        # full current context (each API request re-sends the whole conversation).
         for ($i = $lines.Count - 1; $i -ge 0; $i--) {
             $line = $lines[$i]
             if (-not $line -or -not $line.Trim()) { continue }
-            try { $rec = $line | ConvertFrom-Json } catch { continue }  # tolerate a mid-write partial line
-
-            $msg = Get-Prop $rec 'message'
-            $usage = Get-Prop $msg 'usage'
+            try { $rec = $line | ConvertFrom-Json } catch { continue }  # tolerate a partial line
+            $usage = Get-Prop (Get-Prop $rec 'message') 'usage'
             if ($null -eq $usage) { continue }
-
-            $in    = Get-Prop $usage 'input_tokens'
-            $cRead = Get-Prop $usage 'cache_read_input_tokens'
-            $cNew  = Get-Prop $usage 'cache_creation_input_tokens'
             # [long]$null coerces to 0, so missing cache fields are safe.
-            $contextTokens = [long]$in + [long]$cRead + [long]$cNew
-            $model = Get-Prop $msg 'model'
+            $contextTokens = [long](Get-Prop $usage 'input_tokens') +
+                             [long](Get-Prop $usage 'cache_read_input_tokens') +
+                             [long](Get-Prop $usage 'cache_creation_input_tokens')
             break
         }
-
         if ($null -eq $contextTokens -or $contextTokens -le 0) { exit 0 }
-
-        # Resolve the context limit: longest matching model prefix wins.
-        $limitsPath = Join-Path $PSScriptRoot 'context-limits.json'
-        $limit = 200000
-        if (Test-Path $limitsPath) {
-            $cfg = (Get-Content $limitsPath -Raw | ConvertFrom-Json)
-            $limits = Get-Prop $cfg 'limits'
-            if ($limits) {
-                $best = ''
-                foreach ($p in $limits.PSObject.Properties) {
-                    if ($p.Name -ne '_default' -and $model -and $model.StartsWith($p.Name) -and $p.Name.Length -gt $best.Length) {
-                        $best = $p.Name
-                    }
-                }
-                if ($best) { $limit = [long]$limits.PSObject.Properties[$best].Value }
-                elseif ($limits.PSObject.Properties['_default']) { $limit = [long]$limits.PSObject.Properties['_default'].Value }
-            }
-        }
-
-        $usagePct = [math]::Round(($contextTokens / $limit) * 100, 1)
-        # PostToolUse is the mid-task check: use the higher emergency threshold so
-        # we interrupt an in-progress task only when close to the wall. Every other
-        # event (UserPromptSubmit) uses the normal turn-boundary threshold.
-        $active = if ($eventName -eq 'PostToolUse') { $EmergencyThreshold } else { $Threshold }
-        if (($contextTokens / $limit) -ge $active) { $shouldFire = $true }
+        $budget = if ($eventName -eq 'PostToolUse') { $EmergencyTokenThreshold } else { $TokenThreshold }
+        if ($contextTokens -ge $budget) { $shouldFire = $true }
     }
 
     if (-not $shouldFire) { exit 0 }
 
-    # ---- 4. Fire: write the lock, then instruct Claude ----------------------
+    # ---- 5. Fire: write the lock, then instruct Claude ----------------------
     if (-not (Test-Path $lockDir)) { New-Item -ItemType Directory -Force -Path $lockDir | Out-Null }
     Set-Content -Path $lockFile -Value (Get-Date -Format o) -Encoding ascii
 
-    # Save inside the project when there is one; otherwise use the central
-    # ~\.claude\handoffs so we never litter the user's home directory.
+    $handoffsDir = Join-Path $projectDir 'handoffs'
     $isRealProject = ($projectDir -and (Test-Path $projectDir) -and
                       ($projectDir.TrimEnd('\') -ne $env:USERPROFILE.TrimEnd('\')))
-    if ($isRealProject) {
-        $handoffsDir = Join-Path $projectDir 'handoffs'
-    } else {
-        $handoffsDir = Join-Path $env:USERPROFILE '.claude\handoffs'
-    }
+    if (-not $isRealProject) { $handoffsDir = Join-Path $env:USERPROFILE '.claude\handoffs' }
+
     $timestamp   = Get-Date -Format 'yyyy-MM-dd-HHmmss'
     $handoffFile = Join-Path $handoffsDir "handoff-$timestamp.md"
+    $tokenStr = if ($contextTokens) { "{0:N0}" -f $contextTokens } else { 'many' }
     $reason = if ($eventName -eq 'PreCompact') { 'Context compaction is imminent.' }
-              elseif ($eventName -eq 'PostToolUse') { "Context usage has reached $usagePct% mid-task (emergency threshold)." }
-              else { "Context usage has reached $usagePct% of the window." }
+              elseif ($eventName -eq 'PostToolUse') { "Context has reached $tokenStr tokens mid-task." }
+              else { "Context has reached $tokenStr tokens." }
 
     $instruction = @"
 [relay] $reason Before continuing with the user's request, write a session handoff document so progress survives.
@@ -189,6 +165,5 @@ After writing it, tell the user: "Handoff saved to: $handoffFile" and then conti
     exit 0
 }
 catch {
-    # A monitor must never break the session it monitors.
     exit 0
 }

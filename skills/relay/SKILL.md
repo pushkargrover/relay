@@ -10,9 +10,9 @@ Relay generates structured session handoff documents so work can be resumed seam
 
 ## Automatic Behavior
 
-The plugin checks context usage on **every user turn** by reading real token counts from the session transcript. When usage reaches **90% of the model's context window**, it instructs Claude to write a handoff document before continuing, once per session.
+The plugin checks context on **every user turn** by reading the real token count from the session transcript. When it reaches the **token budget** (default 150,000 tokens), it instructs Claude to write a handoff document before continuing, once per session. Relay uses an absolute token budget rather than a percentage because the true context window isn't exposed to hooks and varies by model.
 
-For long single turns that never return to a prompt boundary, a **mid-task check runs after each tool call** and fires at a higher emergency threshold (**95%** by default), so an in-progress task is interrupted only when genuinely close to the limit. A `PreCompact` backstop also fires if compaction ever arrives first.
+For long single turns that never return to a prompt boundary, a **throttled mid-task check runs after tool calls** and fires at a higher emergency budget (default 190,000 tokens). A `PreCompact` backstop also fires right before compaction — this is the reliable near-full signal for any model, since Claude Code knows the true window.
 
 Save locations:
 - Inside a project: `<project-root>/handoffs/handoff-YYYY-MM-DD-HHMMSS.md`
@@ -20,10 +20,10 @@ Save locations:
 
 ## Changing the Threshold
 
-Set `RELAY_THRESHOLD` (turn-boundary check, default `0.90`) and/or `RELAY_EMERGENCY_THRESHOLD` (mid-task check, default `0.95`) to a fraction between 0 and 1. Keep the emergency value higher than the normal one. Set per-machine in settings.json:
+Set `RELAY_TOKEN_THRESHOLD` (turn-boundary budget, default `150000` tokens) and/or `RELAY_EMERGENCY_TOKEN_THRESHOLD` (mid-task budget, default `190000`). Keep the emergency value higher. On a big-window model, raise both. Set per-machine in settings.json:
 
 ```json
-{ "env": { "RELAY_THRESHOLD": "0.80", "RELAY_EMERGENCY_THRESHOLD": "0.97" } }
+{ "env": { "RELAY_TOKEN_THRESHOLD": "120000", "RELAY_EMERGENCY_TOKEN_THRESHOLD": "180000" } }
 ```
 
 ## Manual Invocation
