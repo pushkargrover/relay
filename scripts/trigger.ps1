@@ -91,34 +91,58 @@ try {
         ($eventName -eq 'UserPromptSubmit' -or $eventName -eq 'Stop' -or $eventName -eq 'PostToolUse')) {
         $recLock = Join-Path $lockDir "$sessionId.recovered"
         if (-not (Test-Path $recLock)) {
+            # Precise detection: scan newest-first. The FIRST record that is either a
+            # lockout error or a *successful* assistant reply decides. A success after
+            # a 429 means you already recovered, so do not fire.
             $lockout = $false
-            foreach ($ln in (Get-Content -Path $transcriptPath -Tail 15 -ErrorAction SilentlyContinue)) {
+            $tail = @(Get-Content -Path $transcriptPath -Tail 20 -ErrorAction SilentlyContinue)
+            for ($i = $tail.Count - 1; $i -ge 0; $i--) {
+                $ln = $tail[$i]
                 if (-not $ln -or -not $ln.Trim()) { continue }
                 try { $r = $ln | ConvertFrom-Json } catch { continue }
-                if ((Get-Prop $r 'apiErrorStatus') -eq 429 -or (Get-Prop $r 'error') -eq 'rate_limit') { $lockout = $true; break }
+                $apiErr = Get-Prop $r 'apiErrorStatus'; $err = [string](Get-Prop $r 'error'); $rtype = Get-Prop $r 'type'
+                if (($apiErr -eq 429) -or ($err -like '*rate_limit*') -or ($err -like '*quota*') -or ($rtype -eq 'rate_limit_error')) {
+                    $lockout = $true; break
+                }
+                $msg = Get-Prop $r 'message'
+                if ($rtype -eq 'assistant' -and (Get-Prop $msg 'usage') -and -not $err) { break }  # recovered / not locked out
             }
             if ($lockout) {
+                # Verify Ollama is reachable BEFORE committing the lock, so a lockout
+                # while Ollama is off does not permanently block recovery (it retries).
+                $ollamaOk = $true
+                if ($env:RELAY_NO_SPAWN -ne '1') {
+                    $ollamaUrl = if ($env:RELAY_OLLAMA_URL) { $env:RELAY_OLLAMA_URL.TrimEnd('/') } else { 'http://localhost:11434' }
+                    try { Invoke-RestMethod -Uri "$ollamaUrl/api/tags" -Method Get -TimeoutSec 4 | Out-Null } catch { $ollamaOk = $false }
+                }
+                if (-not $ollamaOk) {
+                    try { Add-Content -Path (Join-Path $env:USERPROFILE '.claude\handoffs\.relay-recover.log') -Value "$(Get-Date -Format o) trigger: 429 detected but Ollama unreachable; will retry" } catch {}
+                    exit 0   # no lock written -> retries on the next hook fire
+                }
                 $recDir = if ($projectDir -and (Test-Path $projectDir) -and ($projectDir.TrimEnd('\') -ne $env:USERPROFILE.TrimEnd('\'))) {
                     Join-Path $projectDir 'handoffs'
                 } else { Join-Path $env:USERPROFILE '.claude\handoffs' }
                 if (-not (Test-Path $recDir)) { New-Item -ItemType Directory -Force -Path $recDir | Out-Null }
                 $recFile = Join-Path $recDir "handoff-$(Get-Date -Format 'yyyy-MM-dd-HHmmss')-local.md"
                 if (-not (Test-Path $lockDir)) { New-Item -ItemType Directory -Force -Path $lockDir | Out-Null }
-                Set-Content -Path $recLock -Value $recFile -Encoding ascii
+                # Atomic lock: exclusive create. If another hook already claimed it, skip.
+                try {
+                    $fs = [System.IO.File]::Open($recLock, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+                    $sw = New-Object System.IO.StreamWriter($fs); $sw.Write($recFile); $sw.Dispose(); $fs.Dispose()
+                } catch { exit 0 }   # lost the race
                 if ($env:RELAY_NO_SPAWN -ne '1') {
                     $recoverScript = Join-Path $PSScriptRoot 'relay-recover.ps1'
-                    $recLog = Join-Path $env:USERPROFILE '.claude\handoffs\.relay-recover.log'
-                    try { Add-Content -Path $recLog -Value "$(Get-Date -Format o) trigger: 429 detected, launching recovery for $sessionId -> $recFile" } catch {}
-                    # Launch via WMI so the process is owned by the WMI service and
-                    # SURVIVES Claude Code killing the hook's process tree on return.
-                    # Start-Process children stay in the hook's job and get killed.
-                    $cmdLine = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$recoverScript`" -Session $sessionId -Out `"$recFile`""
+                    try { Add-Content -Path (Join-Path $env:USERPROFILE '.claude\handoffs\.relay-recover.log') -Value "$(Get-Date -Format o) trigger: 429 detected, launching recovery for $sessionId -> $recFile" } catch {}
+                    # Recover the EXACT transcript the hook saw (no session lookup), and
+                    # pass the lock so relay-recover clears it on failure (enables retry).
+                    # Launch via WMI so the process survives Claude Code killing the hook tree.
+                    $cmdLine = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$recoverScript`" -Transcript `"$transcriptPath`" -Out `"$recFile`" -LockFile `"$recLock`""
                     try {
                         ([wmiclass]'Win32_Process').Create($cmdLine) | Out-Null
                     } catch {
                         Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ErrorAction SilentlyContinue -ArgumentList @(
                             '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$recoverScript,
-                            '-Session',$sessionId,'-Out',$recFile)
+                            '-Transcript',$transcriptPath,'-Out',$recFile,'-LockFile',$recLock)
                     }
                 }
                 exit 0   # Claude is locked out; nothing to inject.

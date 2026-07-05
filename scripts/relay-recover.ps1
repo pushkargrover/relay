@@ -20,6 +20,8 @@ param(
     [string]$Model,
     [string]$Out,
     [string]$Session,
+    [string]$Transcript,
+    [string]$LockFile,
     [switch]$Help
 )
 
@@ -37,7 +39,10 @@ function Write-RecLog($m) {
         Add-Content -Path $script:RecLog -Value "$(Get-Date -Format o) $m"
     } catch {}
 }
-trap { Write-RecLog "ERROR: $($_.Exception.Message)"; break }
+function Clear-LockOnFail { if ($LockFile -and (Test-Path $LockFile)) { Remove-Item $LockFile -Force -ErrorAction SilentlyContinue } }
+function Fail($m) { Write-Host $m -ForegroundColor Yellow; Write-RecLog "fail: $m"; Clear-LockOnFail; exit 1 }
+# A failed recovery must clear the lock so the next hook fire retries.
+trap { Write-RecLog "ERROR: $($_.Exception.Message)"; Clear-LockOnFail; break }
 
 function Show-Usage {
     Get-Content $PSCommandPath | Select-Object -First 18 | ForEach-Object { $_ -replace '^# ?', '' }
@@ -179,10 +184,10 @@ if ($Help) { Show-Usage; exit 0 }
 
 # Verify Ollama is reachable early, with a clear message.
 try { Invoke-RestMethod -Uri "$OllamaUrl/api/tags" -Method Get -TimeoutSec 10 | Out-Null }
-catch { Write-Host "ERROR: Cannot reach Ollama at $OllamaUrl. Is it installed and running? (https://ollama.com)" -ForegroundColor Red; exit 1 }
+catch { Fail "ERROR: Cannot reach Ollama at $OllamaUrl. Is it installed and running? (https://ollama.com)" }
 
 $recent = Get-RecentTranscripts 15
-if (-not $recent -or $recent.Count -eq 0) { Write-Host "No session transcripts found under $ProjectsDir" -ForegroundColor Yellow; exit 1 }
+if (-not $Transcript -and (-not $recent -or $recent.Count -eq 0)) { Write-Host "No session transcripts found under $ProjectsDir" -ForegroundColor Yellow; exit 1 }
 
 if ($List) {
     Write-Host "Recent sessions (newest first):`n"
@@ -198,9 +203,12 @@ if ($List) {
 
 # Select which transcript.
 $target = $null
-if ($Session) {
+if ($Transcript) {
+    if (-not (Test-Path $Transcript)) { Fail "Transcript not found: $Transcript" }
+    $target = Get-Item $Transcript   # recover this exact file (no session lookup)
+} elseif ($Session) {
     $target = $recent | Where-Object { $_.BaseName -eq $Session } | Select-Object -First 1
-    if (-not $target) { Write-Host "Session '$Session' not found in recent transcripts. Try -List." -ForegroundColor Yellow; exit 1 }
+    if (-not $target) { Fail "Session '$Session' not found in recent transcripts. Try -List." }
 } elseif ($Selection) {
     $n = 0
     if (-not [int]::TryParse($Selection, [ref]$n) -or $n -lt 1 -or $n -gt $recent.Count) {
@@ -232,12 +240,12 @@ Write-RecLog "start: session=$($meta.SessionId) -> $handoffFile"
 
 $model = Resolve-Model
 $convo = Get-CleanConversation $target
-if (-not $convo.Trim()) { Write-Host "That transcript has no readable conversation content." -ForegroundColor Yellow; exit 1 }
+if (-not $convo.Trim()) { Fail "That transcript has no readable conversation content." }
 
 Write-Host "Synthesizing with local model '$model' (this can take a couple of minutes)..." -ForegroundColor Cyan
 $prompt = Build-Prompt $convo
 $markdown = Invoke-Ollama $model $prompt
-if (-not $markdown -or -not $markdown.Trim()) { Write-Host "The local model returned nothing." -ForegroundColor Red; exit 1 }
+if (-not $markdown -or -not $markdown.Trim()) { Fail "The local model returned nothing." }
 
 $header = "<!-- Generated locally by Relay via Ollama ($model). Source session: $($meta.SessionId) -->`n`n"
 Set-Content -Path $handoffFile -Value ($header + $markdown) -Encoding utf8

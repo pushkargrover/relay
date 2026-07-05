@@ -42,6 +42,25 @@ def _rec_log(msg):
         pass
 
 
+_LOCKFILE = None
+
+
+def _clear_lock():
+    # A failed recovery must clear the lock so the next hook fire retries.
+    if _LOCKFILE and os.path.exists(_LOCKFILE):
+        try:
+            os.remove(_LOCKFILE)
+        except OSError:
+            pass
+
+
+def _fail(msg):
+    print(msg, file=sys.stderr)
+    _rec_log("fail: " + msg)
+    _clear_lock()
+    return 1
+
+
 def recent_transcripts(count=15):
     items = []
     if not os.path.isdir(PROJECTS_DIR):
@@ -198,15 +217,19 @@ def main(argv=None):
     p.add_argument("--model", help="Ollama model name")
     p.add_argument("--out", help="output path for the handoff")
     p.add_argument("--session", help="recover a specific session id")
+    p.add_argument("--transcript", help="recover this exact transcript file (no session lookup)")
+    p.add_argument("--lockfile", help="lock file to remove on failure (enables retry)")
     args = p.parse_args(argv)
 
+    global _LOCKFILE
+    _LOCKFILE = args.lockfile
+
     if not ollama_reachable():
-        print("ERROR: Cannot reach Ollama at {}. Is it installed and running? "
-              "(https://ollama.com)".format(OLLAMA_URL), file=sys.stderr)
-        return 1
+        return _fail("ERROR: Cannot reach Ollama at {}. Is it installed and running? "
+                     "(https://ollama.com)".format(OLLAMA_URL))
 
     recent = recent_transcripts(15)
-    if not recent:
+    if not args.transcript and not recent:
         print("No session transcripts found under " + PROJECTS_DIR, file=sys.stderr)
         return 1
 
@@ -222,11 +245,14 @@ def main(argv=None):
         return 0
 
     # Select transcript.
-    if args.session:
+    if args.transcript:
+        if not os.path.isfile(args.transcript):
+            return _fail("Transcript not found: " + args.transcript)
+        target = args.transcript   # recover this exact file (no session lookup)
+    elif args.session:
         match = [pth for (pth, _mt) in recent if os.path.splitext(os.path.basename(pth))[0] == args.session]
         if not match:
-            print("Session '{}' not found in recent transcripts. Try --list.".format(args.session), file=sys.stderr)
-            return 1
+            return _fail("Session '{}' not found in recent transcripts. Try --list.".format(args.session))
         target = match[0]
     elif args.selection:
         if not args.selection.isdigit() or not (1 <= int(args.selection) <= len(recent)):
@@ -260,14 +286,12 @@ def main(argv=None):
     model = resolve_model(args.model)
     convo = clean_conversation(target)
     if not convo.strip():
-        print("That transcript has no readable conversation content.", file=sys.stderr)
-        return 1
+        return _fail("That transcript has no readable conversation content.")
 
     print("Synthesizing with local model '{}' (this can take a couple of minutes)...".format(model))
     markdown = invoke_ollama(model, build_prompt(convo))
     if not markdown or not markdown.strip():
-        print("The local model returned nothing.", file=sys.stderr)
-        return 1
+        return _fail("The local model returned nothing.")
 
     header = "<!-- Generated locally by Relay via Ollama ({}). Source session: {} -->\n\n".format(model, meta["session_id"])
     with open(handoff_file, "w", encoding="utf-8") as f:
@@ -283,4 +307,5 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as e:  # log failures from detached runs
         _rec_log("ERROR: {}".format(e))
+        _clear_lock()
         sys.exit(1)

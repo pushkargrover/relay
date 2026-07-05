@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime
 
 TAIL_LINES = 40
@@ -110,42 +111,69 @@ def main():
             and os.path.isfile(transcript_path)
             and event_name in ("UserPromptSubmit", "Stop", "PostToolUse")):
         rec_lock = os.path.join(lock_dir, session_id + ".recovered")
+        rec_log = os.path.join(home, ".claude", "handoffs", ".relay-recover.log")
         if not os.path.exists(rec_lock):
-            lockout = False
+            # Precise detection: newest-first; the first lockout error or successful
+            # assistant reply decides. A success after a 429 = already recovered.
             try:
                 with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
-                    for line in f.readlines()[-15:]:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            r = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if r.get("apiErrorStatus") == 429 or r.get("error") == "rate_limit":
-                            lockout = True
-                            break
+                    tail = f.readlines()[-20:]
             except OSError:
-                lockout = False
+                tail = []
+            lockout = False
+            for line in reversed(tail):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                err = str(r.get("error") or "")
+                rtype = r.get("type")
+                if r.get("apiErrorStatus") == 429 or "rate_limit" in err or "quota" in err or rtype == "rate_limit_error":
+                    lockout = True
+                    break
+                if rtype == "assistant" and (r.get("message") or {}).get("usage") and not r.get("error"):
+                    break  # recovered / not locked out
             if lockout:
+                # Verify Ollama before committing the lock, so a lockout while Ollama
+                # is off does not permanently block recovery (it retries next hook).
+                if os.environ.get("RELAY_NO_SPAWN") != "1":
+                    ourl = os.environ.get("RELAY_OLLAMA_URL", "http://localhost:11434").rstrip("/")
+                    try:
+                        urllib.request.urlopen(ourl + "/api/tags", timeout=4).read()
+                    except Exception:
+                        try:
+                            with open(rec_log, "a", encoding="utf-8") as lf:
+                                lf.write("{} trigger: 429 detected but Ollama unreachable; will retry\n".format(datetime.now().isoformat()))
+                        except OSError:
+                            pass
+                        return  # no lock -> retries
                 is_proj = os.path.isdir(project_dir) and os.path.realpath(project_dir) != os.path.realpath(home)
                 rec_dir = os.path.join(project_dir, "handoffs") if is_proj else os.path.join(home, ".claude", "handoffs")
                 os.makedirs(rec_dir, exist_ok=True)
                 rec_file = os.path.join(rec_dir, "handoff-{}-local.md".format(datetime.now().strftime("%Y-%m-%d-%H%M%S")))
                 os.makedirs(lock_dir, exist_ok=True)
-                with open(rec_lock, "w", encoding="ascii") as f:
-                    f.write(rec_file)
+                # Atomic lock: exclusive create. If another hook claimed it, skip.
+                try:
+                    with open(rec_lock, "x", encoding="ascii") as f:
+                        f.write(rec_file)
+                except FileExistsError:
+                    return
                 if os.environ.get("RELAY_NO_SPAWN") != "1":
                     try:
-                        with open(os.path.join(home, ".claude", "handoffs", ".relay-recover.log"), "a", encoding="utf-8") as lf:
+                        with open(rec_log, "a", encoding="utf-8") as lf:
                             lf.write("{} trigger: 429 detected, launching recovery for {} -> {}\n".format(
                                 datetime.now().isoformat(), session_id, rec_file))
                     except OSError:
                         pass
                     recover_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay-recover.py")
                     try:
+                        # Recover the EXACT transcript; pass the lock so it clears on failure.
                         # start_new_session detaches the child so it survives the hook returning.
-                        subprocess.Popen([sys.executable, recover_py, "--session", session_id, "--out", rec_file],
+                        subprocess.Popen([sys.executable, recover_py, "--transcript", transcript_path,
+                                          "--out", rec_file, "--lockfile", rec_lock],
                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
                     except Exception:
                         pass

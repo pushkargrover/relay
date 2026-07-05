@@ -9,6 +9,7 @@ unset RELAY_PLAN_THRESHOLD
 unset RELAY_DEBUG
 unset RELAY_AUTO_RECOVER
 unset RELAY_NO_SPAWN
+unset RELAY_OLLAMA_URL
 
 DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 TRIGGER="$DIR/../scripts/trigger.py"
@@ -213,6 +214,43 @@ s=r-off; clearlock $s
 t=$(fixture429 lockout4.jsonl)
 printf '%s' "$(hookinput "$t" $s UserPromptSubmit)" | RELAY_AUTO_RECOVER=0 "$PY" "$TRIGGER" >/dev/null
 [ ! -f "$LOCKDIR/$s.recovered" ]; assert $? "RELAY_AUTO_RECOVER=0 disables recovery"
+clearlock $s
+
+# --- Hardening: precise detection (success after 429 = already recovered) ---
+s=r-recovered; clearlock $s
+fp="$FIXTURES/lockout-recovered.jsonl"
+{
+  echo '{"type":"user","message":{"role":"user","content":"hi"}}'
+  echo '{"type":"assistant","apiErrorStatus":429,"error":"rate_limit","message":{"content":"limited"}}'
+  echo '{"type":"assistant","message":{"model":"m","usage":{"input_tokens":100,"cache_read_input_tokens":1,"cache_creation_input_tokens":1}}}'
+} > "$fp"
+invoke "$(hookinput "$fp" $s UserPromptSubmit)" >/dev/null
+[ ! -f "$LOCKDIR/$s.recovered" ]; assert $? "success after 429 = recovered -> no recovery (precise detection)"
+clearlock $s
+
+# --- Hardening: broadened detection (rate_limit_error type) ---
+s=r-rlerr; clearlock $s
+fp="$FIXTURES/lockout-type.jsonl"
+{ echo '{"type":"user","message":{"content":"hi"}}'; echo '{"type":"rate_limit_error","message":{"content":"limited"}}'; } > "$fp"
+invoke "$(hookinput "$fp" $s UserPromptSubmit)" >/dev/null
+[ -f "$LOCKDIR/$s.recovered" ]; assert $? "type=rate_limit_error triggers recovery (broadened detection)"
+clearlock $s
+
+# --- Hardening: broadened detection (over_quota) ---
+s=r-quota; clearlock $s
+fp="$FIXTURES/lockout-quota.jsonl"
+{ echo '{"type":"user","message":{"content":"hi"}}'; echo '{"type":"assistant","error":"over_quota","message":{"content":"limited"}}'; } > "$fp"
+invoke "$(hookinput "$fp" $s UserPromptSubmit)" >/dev/null
+[ -f "$LOCKDIR/$s.recovered" ]; assert $? "error=over_quota triggers recovery (broadened detection)"
+clearlock $s
+
+# --- Hardening: Ollama unreachable at lockout -> no lock (retries later) ---
+s=r-nollama; clearlock $s
+fp=$(fixture429 lockout-nollama.jsonl)
+unset RELAY_NO_SPAWN
+printf '%s' "$(hookinput "$fp" $s UserPromptSubmit)" | RELAY_OLLAMA_URL=http://127.0.0.1:9 "$PY" "$TRIGGER" >/dev/null
+export RELAY_NO_SPAWN=1
+[ ! -f "$LOCKDIR/$s.recovered" ]; assert $? "Ollama unreachable at lockout -> no lock (will retry)"
 clearlock $s
 
 unset RELAY_NO_SPAWN

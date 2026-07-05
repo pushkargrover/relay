@@ -1,6 +1,6 @@
 {
   "name": "relay",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "Monitors context usage live and auto-writes a structured handoff document at 90% so your work survives compaction and resumes in any AI agent.",
   "author": { "name": "Pushkar Grover" },
   "repository": "https://github.com/pushkargrover/relay",

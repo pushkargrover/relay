@@ -4,7 +4,7 @@
 
 $ErrorActionPreference = 'Stop'
 # Pin the environment: a leaked budget override would corrupt boundary asserts.
-foreach ($v in 'RELAY_TOKEN_THRESHOLD','RELAY_EMERGENCY_TOKEN_THRESHOLD','RELAY_PLAN_THRESHOLD','RELAY_DEBUG','RELAY_AUTO_RECOVER','RELAY_NO_SPAWN') {
+foreach ($v in 'RELAY_TOKEN_THRESHOLD','RELAY_EMERGENCY_TOKEN_THRESHOLD','RELAY_PLAN_THRESHOLD','RELAY_DEBUG','RELAY_AUTO_RECOVER','RELAY_NO_SPAWN','RELAY_OLLAMA_URL') {
     if (Test-Path "env:$v") { Remove-Item "env:$v" }
 }
 $trigger  = Join-Path $PSScriptRoot '..\scripts\trigger.ps1'
@@ -258,6 +258,45 @@ $env:RELAY_AUTO_RECOVER = '0'
 $(New-HookInput $t $s 'UserPromptSubmit') | powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $trigger | Out-Null
 Remove-Item env:RELAY_AUTO_RECOVER
 Assert (-not (Test-Path (RecLock $s))) "RELAY_AUTO_RECOVER=0 disables recovery"
+Clear-Lock $s
+
+# --- Hardening: precise detection (a success after a 429 = already recovered) ---
+$s='r-recovered'; Clear-Lock $s
+$fp = Join-Path $fixtures 'lockout-recovered.jsonl'
+@(
+  '{"type":"user","message":{"role":"user","content":"hi"}}'
+  '{"type":"assistant","apiErrorStatus":429,"error":"rate_limit","message":{"content":"limited"}}'
+  '{"type":"assistant","message":{"model":"m","usage":{"input_tokens":100,"cache_read_input_tokens":1,"cache_creation_input_tokens":1}}}'
+) | Set-Content $fp -Encoding utf8
+Invoke-Trigger (New-HookInput $fp $s 'UserPromptSubmit') | Out-Null
+Assert (-not (Test-Path (RecLock $s))) "success after 429 = recovered -> no recovery (precise detection)"
+Clear-Lock $s
+
+# --- Hardening: broadened detection (rate_limit_error type) ---
+$s='r-rlerr'; Clear-Lock $s
+$fp = Join-Path $fixtures 'lockout-type.jsonl'
+@('{"type":"user","message":{"content":"hi"}}','{"type":"rate_limit_error","message":{"content":"limited"}}') | Set-Content $fp -Encoding utf8
+Invoke-Trigger (New-HookInput $fp $s 'UserPromptSubmit') | Out-Null
+Assert (Test-Path (RecLock $s)) "type=rate_limit_error triggers recovery (broadened detection)"
+Clear-Lock $s
+
+# --- Hardening: broadened detection (over_quota) ---
+$s='r-quota'; Clear-Lock $s
+$fp = Join-Path $fixtures 'lockout-quota.jsonl'
+@('{"type":"user","message":{"content":"hi"}}','{"type":"assistant","error":"over_quota","message":{"content":"limited"}}') | Set-Content $fp -Encoding utf8
+Invoke-Trigger (New-HookInput $fp $s 'UserPromptSubmit') | Out-Null
+Assert (Test-Path (RecLock $s)) "error=over_quota triggers recovery (broadened detection)"
+Clear-Lock $s
+
+# --- Hardening: Ollama unreachable at lockout -> do NOT lock (retries later) ---
+$s='r-nollama'; Clear-Lock $s
+$fp = New-Fixture429 'lockout-nollama.jsonl'
+Remove-Item env:RELAY_NO_SPAWN -ErrorAction SilentlyContinue
+$env:RELAY_OLLAMA_URL = 'http://127.0.0.1:9'
+$(New-HookInput $fp $s 'UserPromptSubmit') | powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $trigger | Out-Null
+Remove-Item env:RELAY_OLLAMA_URL
+$env:RELAY_NO_SPAWN = '1'
+Assert (-not (Test-Path (RecLock $s))) "Ollama unreachable at lockout -> no lock (will retry)"
 Clear-Lock $s
 
 Remove-Item env:RELAY_NO_SPAWN -ErrorAction SilentlyContinue
