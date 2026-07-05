@@ -7,6 +7,8 @@ unset RELAY_TOKEN_THRESHOLD
 unset RELAY_EMERGENCY_TOKEN_THRESHOLD
 unset RELAY_PLAN_THRESHOLD
 unset RELAY_DEBUG
+unset RELAY_AUTO_RECOVER
+unset RELAY_NO_SPAWN
 
 DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 TRIGGER="$DIR/../scripts/trigger.py"
@@ -35,7 +37,15 @@ fixture() { # name total_tokens [extra_line]
     echo "$f"
 }
 hookinput() { cwd="${4:-$FIXTURES}"; "$PY" -c "import json,sys;print(json.dumps({'session_id':sys.argv[2],'transcript_path':sys.argv[1],'cwd':sys.argv[4],'hook_event_name':sys.argv[3]}))" "$1" "$2" "$3" "$cwd"; }
-clearlock() { rm -f "$LOCKDIR/$1.lock" "$LOCKDIR/$1.last"; }
+clearlock() { rm -f "$LOCKDIR/$1.lock" "$LOCKDIR/$1.last" "$LOCKDIR/$1.recovered"; }
+fixture429() { # name -> transcript whose last record is a 429 lockout
+    f="$FIXTURES/$1"
+    {
+        echo '{"type":"user","message":{"role":"user","content":"hello"}}'
+        echo '{"type":"assistant","isApiErrorMessage":true,"apiErrorStatus":429,"error":"rate_limit","message":{"role":"assistant","content":"rate limited"}}'
+    } > "$f"
+    echo "$f"
+}
 
 # Builds the rich Stop-hook payload. Args: session five_hour_pct [cwd] [has_rl 1/0] [has_5h 1/0] [use_workspace 1/0]
 stopinput() {
@@ -169,6 +179,43 @@ s=sp-workspace; clearlock $s
 out=$(invoke "$(stopinput $s 95 "$FIXTURES" 1 1 1)")
 [ -n "$out" ]; assert $? "plan fires using workspace.current_dir when cwd absent"
 echo "$out" | grep -qF 'handoffs'; assert $? "workspace.current_dir used for handoff path"; clearlock $s
+
+# ---- Lockout auto-recovery (429 in transcript -> spawn a LOCAL handoff) ----
+export RELAY_NO_SPAWN=1
+
+s=r-429; clearlock $s
+t=$(fixture429 lockout1.jsonl)
+invoke "$(hookinput "$t" $s UserPromptSubmit)" >/dev/null
+[ -f "$LOCKDIR/$s.recovered" ]; assert $? "429 in transcript triggers local recovery"
+grep -q 'handoffs' "$LOCKDIR/$s.recovered" 2>/dev/null; assert $? "recover-lock records the handoff output path"
+clearlock $s
+
+s=r-normal; clearlock $s
+t=$(fixture r-no429.jsonl 50000)
+invoke "$(hookinput "$t" $s UserPromptSubmit)" >/dev/null
+[ ! -f "$LOCKDIR/$s.recovered" ]; assert $? "no 429 -> no recovery"
+clearlock $s
+
+s=r-stop; clearlock $s
+t=$(fixture429 lockout2.jsonl)
+invoke "$(hookinput "$t" $s Stop)" >/dev/null
+[ -f "$LOCKDIR/$s.recovered" ]; assert $? "429 detected on Stop event too"
+clearlock $s
+
+s=r-idem; clearlock $s
+mkdir -p "$LOCKDIR"; echo existing > "$LOCKDIR/$s.recovered"
+t=$(fixture429 lockout3.jsonl)
+invoke "$(hookinput "$t" $s UserPromptSubmit)" >/dev/null
+[ "$(cat "$LOCKDIR/$s.recovered")" = "existing" ]; assert $? "already-recovered session does not re-trigger"
+clearlock $s
+
+s=r-off; clearlock $s
+t=$(fixture429 lockout4.jsonl)
+printf '%s' "$(hookinput "$t" $s UserPromptSubmit)" | RELAY_AUTO_RECOVER=0 "$PY" "$TRIGGER" >/dev/null
+[ ! -f "$LOCKDIR/$s.recovered" ]; assert $? "RELAY_AUTO_RECOVER=0 disables recovery"
+clearlock $s
+
+unset RELAY_NO_SPAWN
 
 echo "--------------------------------"
 echo "$PASS passed, $FAIL failed"

@@ -54,7 +54,8 @@ Every handoff contains these 8 sections:
 
 Relay can also generate a handoff with a **local** model via Ollama, using zero Anthropic tokens — useful when the account is rate-limited/locked out and Claude can't write the handoff itself.
 
-- **After a lockout**, the user runs the standalone script in a terminal (no Claude needed): `relay-recover.ps1` (Windows) or `relay-recover.py` (mac/Linux). Flags: `--list`, a bare index, `--session <id>`, `--model <name>`, `--out <path>`.
+- **Automatic on lockout**: if Relay sees a rate-limit `429` in the transcript, it spawns `relay-recover` in the background so the local model writes the handoff without any user action (requires Ollama; disable with `RELAY_AUTO_RECOVER=0`).
+- **After a lockout (manual)**, the user runs the standalone script in a terminal (no Claude needed): `relay-recover.ps1` (Windows) or `relay-recover.py` (mac/Linux). Flags: `--list`, a bare index, `--session <id>`, `--model <name>`, `--out <path>`.
 - **Before a lockout**, the `/handoff-local` command does the same local synthesis on demand.
 - Requires Ollama installed with a model pulled (e.g. `ollama pull gemma4`). Model via `RELAY_OLLAMA_MODEL`, endpoint via `RELAY_OLLAMA_URL`.
 

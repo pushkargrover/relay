@@ -4,7 +4,7 @@
 
 $ErrorActionPreference = 'Stop'
 # Pin the environment: a leaked budget override would corrupt boundary asserts.
-foreach ($v in 'RELAY_TOKEN_THRESHOLD','RELAY_EMERGENCY_TOKEN_THRESHOLD','RELAY_PLAN_THRESHOLD','RELAY_DEBUG') {
+foreach ($v in 'RELAY_TOKEN_THRESHOLD','RELAY_EMERGENCY_TOKEN_THRESHOLD','RELAY_PLAN_THRESHOLD','RELAY_DEBUG','RELAY_AUTO_RECOVER','RELAY_NO_SPAWN') {
     if (Test-Path "env:$v") { Remove-Item "env:$v" }
 }
 $trigger  = Join-Path $PSScriptRoot '..\scripts\trigger.ps1'
@@ -41,11 +41,22 @@ function New-HookInput([string]$transcript, [string]$session, [string]$event, [s
     return ([ordered]@{ session_id = $session; transcript_path = $transcript; cwd = $cwd; hook_event_name = $event } | ConvertTo-Json -Compress)
 }
 function Clear-Lock([string]$session) {
-    foreach ($ext in 'lock','last') {
+    foreach ($ext in 'lock','last','recovered') {
         $f = Join-Path $lockDir "$session.$ext"
         if (Test-Path $f) { Remove-Item $f -Force -Confirm:$false }
     }
 }
+function New-Fixture429([string]$name) {
+    # Transcript whose most recent record is a rate-limit / 429 lockout error.
+    $path = Join-Path $fixtures $name
+    $lines = @(
+        '{"type":"user","message":{"role":"user","content":"hello"}}'
+        '{"type":"assistant","isApiErrorMessage":true,"apiErrorStatus":429,"error":"rate_limit","message":{"role":"assistant","content":"rate limited"}}'
+    )
+    Set-Content -Path $path -Value ($lines -join "`n") -Encoding utf8
+    return $path
+}
+function RecLock([string]$session) { Join-Path $lockDir "$session.recovered" }
 function New-StopInput([string]$session, $fiveHourPct, [string]$cwd = $env:TEMP,
                        [bool]$hasRateLimits = $true, [bool]$hasFiveHour = $true, [bool]$useWorkspace = $false) {
     # Builds the rich Stop-hook payload (per official Claude Code statusline schema).
@@ -204,6 +215,52 @@ $out = Invoke-Trigger (New-StopInput $s 95 $env:TEMP $true $true $true)
 $json = $null; try { $json = $out | ConvertFrom-Json } catch {}
 Assert ($null -ne $json) "plan fires using workspace.current_dir when cwd absent"
 Assert ($json -and $json.hookSpecificOutput.additionalContext -match [regex]::Escape((Join-Path $env:TEMP 'handoffs'))) "workspace.current_dir used for handoff path"; Clear-Lock $s
+
+# ---- Lockout auto-recovery (429 in transcript -> spawn a LOCAL handoff) ----
+# RELAY_NO_SPAWN=1 lets us verify the decision without launching Ollama.
+$env:RELAY_NO_SPAWN = '1'
+
+# R1: a 429 in the transcript triggers local recovery (recover-lock written)
+$s='r-429'; Clear-Lock $s
+$t = New-Fixture429 'lockout1.jsonl'
+Invoke-Trigger (New-HookInput $t $s 'UserPromptSubmit') | Out-Null
+Assert (Test-Path (RecLock $s)) "429 in transcript triggers local recovery"
+Assert ((Test-Path (RecLock $s)) -and ((Get-Content (RecLock $s) -Raw) -match 'handoffs')) "recover-lock records the handoff output path"
+Clear-Lock $s
+
+# R2: a normal transcript (no 429) does not trigger recovery
+$s='r-normal'; Clear-Lock $s
+$t = New-Fixture 'r-no429.jsonl' 50000 @()
+Invoke-Trigger (New-HookInput $t $s 'UserPromptSubmit') | Out-Null
+Assert (-not (Test-Path (RecLock $s))) "no 429 -> no recovery"
+Clear-Lock $s
+
+# R3: the 429 is also detected on the Stop event
+$s='r-stop'; Clear-Lock $s
+$t = New-Fixture429 'lockout2.jsonl'
+Invoke-Trigger (New-HookInput $t $s 'Stop') | Out-Null
+Assert (Test-Path (RecLock $s)) "429 detected on Stop event too"
+Clear-Lock $s
+
+# R4: a session already recovered does not re-trigger (idempotent)
+$s='r-idem'; Clear-Lock $s
+New-Item -ItemType Directory -Force -Path $lockDir | Out-Null
+Set-Content (RecLock $s) 'existing' -Encoding ascii
+$t = New-Fixture429 'lockout3.jsonl'
+Invoke-Trigger (New-HookInput $t $s 'UserPromptSubmit') | Out-Null
+Assert ((Test-Path (RecLock $s)) -and (((Get-Content (RecLock $s) -Raw).Trim()) -eq 'existing')) "already-recovered session does not re-trigger"
+Clear-Lock $s
+
+# R5: RELAY_AUTO_RECOVER=0 disables auto-recovery
+$s='r-off'; Clear-Lock $s
+$t = New-Fixture429 'lockout4.jsonl'
+$env:RELAY_AUTO_RECOVER = '0'
+$(New-HookInput $t $s 'UserPromptSubmit') | powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $trigger | Out-Null
+Remove-Item env:RELAY_AUTO_RECOVER
+Assert (-not (Test-Path (RecLock $s))) "RELAY_AUTO_RECOVER=0 disables recovery"
+Clear-Lock $s
+
+Remove-Item env:RELAY_NO_SPAWN -ErrorAction SilentlyContinue
 
 Write-Host "-----------------------------"
 Write-Host "$script:passed passed, $script:failed failed"

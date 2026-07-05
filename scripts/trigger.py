@@ -16,6 +16,7 @@ on stdout when firing, nothing otherwise. Always exit 0.
 """
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -101,6 +102,47 @@ def main():
         os.makedirs(dbg_dir, exist_ok=True)
         with open(os.path.join(dbg_dir, ".relay-plan-debug.txt"), "a", encoding="utf-8") as f:
             f.write("{} event={} five_hour={}\n".format(datetime.now().isoformat(), event_name, shown))
+
+    # Lockout auto-recovery: a 429 in the transcript means Claude is locked out
+    # and cannot write a handoff, so spawn relay-recover (local Ollama model) in
+    # the background instead - zero Anthropic tokens, works while Claude is dead.
+    if (os.environ.get("RELAY_AUTO_RECOVER") != "0" and transcript_path
+            and os.path.isfile(transcript_path)
+            and event_name in ("UserPromptSubmit", "Stop", "PostToolUse")):
+        rec_lock = os.path.join(lock_dir, session_id + ".recovered")
+        if not os.path.exists(rec_lock):
+            lockout = False
+            try:
+                with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f.readlines()[-15:]:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            r = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if r.get("apiErrorStatus") == 429 or r.get("error") == "rate_limit":
+                            lockout = True
+                            break
+            except OSError:
+                lockout = False
+            if lockout:
+                is_proj = os.path.isdir(project_dir) and os.path.realpath(project_dir) != os.path.realpath(home)
+                rec_dir = os.path.join(project_dir, "handoffs") if is_proj else os.path.join(home, ".claude", "handoffs")
+                os.makedirs(rec_dir, exist_ok=True)
+                rec_file = os.path.join(rec_dir, "handoff-{}-local.md".format(datetime.now().strftime("%Y-%m-%d-%H%M%S")))
+                os.makedirs(lock_dir, exist_ok=True)
+                with open(rec_lock, "w", encoding="ascii") as f:
+                    f.write(rec_file)
+                if os.environ.get("RELAY_NO_SPAWN") != "1":
+                    recover_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay-recover.py")
+                    try:
+                        subprocess.Popen([sys.executable, recover_py, "--session", session_id, "--out", rec_file],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                    except Exception:
+                        pass
+                return
 
     # Once-per-session lock (cheap, before any file read).
     if os.path.exists(lock_file):

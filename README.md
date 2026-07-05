@@ -7,7 +7,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-3fb950?style=flat-square&labelColor=0b0e14)
 ![License](https://img.shields.io/badge/license-MIT-58a6ff?style=flat-square&labelColor=0b0e14)
 ![Dependencies](https://img.shields.io/badge/dependencies-zero-3fb950?style=flat-square&labelColor=0b0e14)
-![Tests](https://img.shields.io/badge/tests-81%20passing-3fb950?style=flat-square&labelColor=0b0e14)
+![Tests](https://img.shields.io/badge/tests-93%20passing-3fb950?style=flat-square&labelColor=0b0e14)
 ![Claude Code](https://img.shields.io/badge/Claude%20Code-plugin-d29922?style=flat-square&labelColor=0b0e14)
 
 **Never lose your session progress again.** Relay monitors your context usage live and automatically writes a structured handoff document at 90%, before compaction erases your work. Resume in any AI agent: Claude, Codex, Gemini, Copilot.
@@ -101,7 +101,9 @@ ollama pull gemma4
 ```
 Then reopen your terminal. (It auto-resolves the latest installed version, so plugin updates never break it.)
 
-**After a lockout — run in any terminal** (Claude isn't needed at all):
+**Automatic lockout recovery.** If Relay detects a rate-limit `429` in the transcript (i.e. you've been locked out and Claude can't respond), it spawns `relay-recover` in the background automatically — the local model writes the handoff for you, no action needed. Requires Ollama; disable with `RELAY_AUTO_RECOVER=0`.
+
+**After a lockout — run in any terminal** (or if you don't use Ollama, Claude isn't needed at all):
 ```text
 relay-recover --list     # pick from recent sessions   (-List on PowerShell)
 relay-recover            # recover the most recent session
@@ -125,7 +127,8 @@ Change the token budgets via environment variables in `settings.json`:
 
 - `RELAY_TOKEN_THRESHOLD` (default `150000`) fires the turn-boundary handoff once context reaches this many tokens.
 - `RELAY_EMERGENCY_TOKEN_THRESHOLD` (default `190000`) is the mid-task budget; keep it higher so long tasks are interrupted only when genuinely large. On a big-window model (e.g. 1M) raise both — `PreCompact` still catches the true near-full moment regardless.
-- `RELAY_PLAN_THRESHOLD` (default `90`) is the 5-hour plan-usage percentage (0–100) that triggers a handoff. Only active on Pro/Max accounts (Claude Code only exposes `rate_limits` there). Set `RELAY_DEBUG=1` to log the observed plan percentage to `~/.claude/handoffs/.relay-plan-debug.txt`.
+- `RELAY_PLAN_THRESHOLD` (default `90`) is the 5-hour plan-usage percentage (0–100) that triggers a handoff. Only fires where Claude Code exposes `rate_limits` to hooks (terminal CLI; **not** the desktop app). Set `RELAY_DEBUG=1` to log the observed plan percentage to `~/.claude/handoffs/.relay-plan-debug.txt`.
+- `RELAY_AUTO_RECOVER` (default on) — set to `0` to disable automatic local recovery when a `429` lockout is detected. Requires Ollama.
 - `RELAY_OLLAMA_MODEL` (local mode) picks the Ollama model; if unset, the first installed model is auto-detected.
 - `RELAY_OLLAMA_URL` (local mode) overrides the Ollama endpoint (default `http://localhost:11434`).
 - `RELAY_OLLAMA_NUM_CTX` (local mode) sets Ollama's context window (default `8192`). Raise it if handoffs from very large sessions come out truncated; lower it to save memory.

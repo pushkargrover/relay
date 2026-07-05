@@ -83,6 +83,39 @@ try {
         Add-Content -Path (Join-Path $dbgDir '.relay-plan-debug.txt') -Value "$(Get-Date -Format o) event=$eventName five_hour=$shown"
     }
 
+    # ---- Lockout auto-recovery ----------------------------------------------
+    # If the transcript shows a rate-limit / 429, Claude is locked out and CANNOT
+    # write a handoff. Instead, spawn relay-recover in the background so the LOCAL
+    # model (Ollama) writes it - zero Anthropic tokens, works while Claude is dead.
+    if (($env:RELAY_AUTO_RECOVER -ne '0') -and $transcriptPath -and (Test-Path $transcriptPath) -and
+        ($eventName -eq 'UserPromptSubmit' -or $eventName -eq 'Stop' -or $eventName -eq 'PostToolUse')) {
+        $recLock = Join-Path $lockDir "$sessionId.recovered"
+        if (-not (Test-Path $recLock)) {
+            $lockout = $false
+            foreach ($ln in (Get-Content -Path $transcriptPath -Tail 15 -ErrorAction SilentlyContinue)) {
+                if (-not $ln -or -not $ln.Trim()) { continue }
+                try { $r = $ln | ConvertFrom-Json } catch { continue }
+                if ((Get-Prop $r 'apiErrorStatus') -eq 429 -or (Get-Prop $r 'error') -eq 'rate_limit') { $lockout = $true; break }
+            }
+            if ($lockout) {
+                $recDir = if ($projectDir -and (Test-Path $projectDir) -and ($projectDir.TrimEnd('\') -ne $env:USERPROFILE.TrimEnd('\'))) {
+                    Join-Path $projectDir 'handoffs'
+                } else { Join-Path $env:USERPROFILE '.claude\handoffs' }
+                if (-not (Test-Path $recDir)) { New-Item -ItemType Directory -Force -Path $recDir | Out-Null }
+                $recFile = Join-Path $recDir "handoff-$(Get-Date -Format 'yyyy-MM-dd-HHmmss')-local.md"
+                if (-not (Test-Path $lockDir)) { New-Item -ItemType Directory -Force -Path $lockDir | Out-Null }
+                Set-Content -Path $recLock -Value $recFile -Encoding ascii
+                if ($env:RELAY_NO_SPAWN -ne '1') {
+                    $recoverScript = Join-Path $PSScriptRoot 'relay-recover.ps1'
+                    Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ErrorAction SilentlyContinue -ArgumentList @(
+                        '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$recoverScript,
+                        '-Session',$sessionId,'-Out',$recFile)
+                }
+                exit 0   # Claude is locked out; nothing to inject.
+            }
+        }
+    }
+
     # ---- 2. Once-per-session lock (cheap, before any file read) -------------
     if (Test-Path $lockFile) { exit 0 }
 
