@@ -74,6 +74,15 @@ try {
     $lockDir  = Join-Path $env:USERPROFILE '.claude\handoffs\.locks'
     $lockFile = Join-Path $lockDir "$sessionId.lock"
 
+    # ---- Debug trace: log EVERY hook fire (before any exit) when RELAY_DEBUG set.
+    if ($env:RELAY_DEBUG) {
+        $rlPct = Get-Prop (Get-Prop (Get-Prop $hookInput 'rate_limits') 'five_hour') 'used_percentage'
+        $shown = if ($null -ne $rlPct) { $rlPct } else { 'absent' }
+        $dbgDir = Join-Path $env:USERPROFILE '.claude\handoffs'
+        if (-not (Test-Path $dbgDir)) { New-Item -ItemType Directory -Force -Path $dbgDir | Out-Null }
+        Add-Content -Path (Join-Path $dbgDir '.relay-plan-debug.txt') -Value "$(Get-Date -Format o) event=$eventName five_hour=$shown"
+    }
+
     # ---- 2. Once-per-session lock (cheap, before any file read) -------------
     if (Test-Path $lockFile) { exit 0 }
 
@@ -104,12 +113,6 @@ try {
         $rl  = Get-Prop $hookInput 'rate_limits'
         $fh  = if ($rl) { Get-Prop $rl 'five_hour' } else { $null }
         $pct = if ($fh) { Get-Prop $fh 'used_percentage' } else { $null }
-        if ($env:RELAY_DEBUG) {
-            $dbgDir = Join-Path $env:USERPROFILE '.claude\handoffs'
-            if (-not (Test-Path $dbgDir)) { New-Item -ItemType Directory -Force -Path $dbgDir | Out-Null }
-            $shown = if ($null -ne $pct) { $pct } else { 'absent' }
-            Add-Content -Path (Join-Path $dbgDir '.relay-plan-debug.txt') -Value "$(Get-Date -Format o) five_hour.used_percentage=$shown"
-        }
         if ($null -eq $pct) { exit 0 }
         if ([double]$pct -ge $PlanThreshold) { $shouldFire = $true; $planPct = [double]$pct }
         else { exit 0 }

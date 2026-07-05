@@ -93,6 +93,15 @@ def main():
     lock_dir = os.path.join(home, ".claude", "handoffs", ".locks")
     lock_file = os.path.join(lock_dir, session_id + ".lock")
 
+    # Debug trace: log EVERY hook fire (before any exit) when RELAY_DEBUG is set.
+    if os.environ.get("RELAY_DEBUG"):
+        rl_pct = ((hook_input.get("rate_limits") or {}).get("five_hour") or {}).get("used_percentage")
+        shown = rl_pct if rl_pct is not None else "absent"
+        dbg_dir = os.path.join(home, ".claude", "handoffs")
+        os.makedirs(dbg_dir, exist_ok=True)
+        with open(os.path.join(dbg_dir, ".relay-plan-debug.txt"), "a", encoding="utf-8") as f:
+            f.write("{} event={} five_hour={}\n".format(datetime.now().isoformat(), event_name, shown))
+
     # Once-per-session lock (cheap, before any file read).
     if os.path.exists(lock_file):
         return
@@ -123,12 +132,6 @@ def main():
         # Plan-usage check: read the 5-hour rolling limit from the payload.
         # Every level may be absent (non-Pro/Max, or before the first API response).
         pct = ((hook_input.get("rate_limits") or {}).get("five_hour") or {}).get("used_percentage")
-        if os.environ.get("RELAY_DEBUG"):
-            dbg_dir = os.path.join(home, ".claude", "handoffs")
-            os.makedirs(dbg_dir, exist_ok=True)
-            shown = pct if pct is not None else "absent"
-            with open(os.path.join(dbg_dir, ".relay-plan-debug.txt"), "a", encoding="utf-8") as f:
-                f.write("{} five_hour.used_percentage={}\n".format(datetime.now().isoformat(), shown))
         if pct is None:
             return
         if float(pct) >= plan_threshold():
